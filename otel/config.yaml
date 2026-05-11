@@ -1,0 +1,284 @@
+# =============================================================================
+# OTel Collector — producción optimizada
+# =============================================================================
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        # Buckets ajustados a latencias reales de API — no buckets genéricos
+        buckets: [10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s]
+    dimensions:
+      - name: http.method
+      - name: http.status_code
+      # http.route solo si tus APIs NO tienen path params dinámicos
+      # Si tienes /users/{id} usa http.target normalizado o elimínalo
+      - name: http.route
+      - name: tyk.api.name
+      - name: http.target
+      #- name: service.name
+    namespace: gw
+    # Limitar cardinalidad — crítico en producción
+    metrics_flush_interval: 60s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777  # solo loopback en producción
+
+receivers:
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  redis:
+    endpoint: "tyk-redis:6379"
+    #endpoint: "172.18.0.1:6379"
+    collection_interval: 30s  # 10s es excesivo para Redis en producción
+
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400        # más conservador — deja margen al SO
+    spike_limit_mib: 100
+
+  # Batch diferenciado por señal — logs necesitan menor latencia que métricas
+  batch/traces:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  batch/metrics:
+    timeout: 30s          # métricas toleran más latencia
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  batch/logs:
+    timeout: 5s
+    send_batch_size: 256  # logs más pequeños, batch más pequeño
+    send_batch_max_size: 512
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: "${ENVIRONMENT}"
+        action: upsert
+      - key: cloud.provider
+        value: azure
+        action: insert
+
+  filter/drop_health_traces:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.route"] == "/healthz"'
+        - 'IsMatch(attributes["http.url"], ".*/health.*")'
+
+  transform/parse_tyk:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+
+          # ------------------------------------------------------------
+          # Parse JSON in body,
+          # ------------------------------------------------------------
+
+          - merge_maps(attributes, ParseJSON(body), "upsert")
+            where body != nil and IsMatch(body, "^\\{")
+
+
+          # ------------------------------------------------------------
+          # Extract trace_id and span_id from attributes if exist
+          # ------------------------------------------------------------
+          #- set(trace_id, attributes["trace_id"])
+            #where attributes["trace_id"] != nil
+
+          #- set(span_id, attributes["span_id"])
+            #where attributes["span_id"] != nil
+
+          # if the body is empty and exist propertie type in body with value "request" build the strcture msg
+          # <type>: <method> <path> <status> latency_total=<latency_total> latency_gateway=<latency_gateway> upstream_latency=<upstream_latency> trace_id=<trace_id>
+          
+          - >-
+            set(body, Concat([attributes["type"], ": ",
+            attributes["method"], " ", attributes["path"], " ",
+            attributes["status"]], ""))
+            where attributes["type"] == "request"
+            and attributes["method"] != nil
+            and attributes["path"] != nil
+            and attributes["status"] != nil
+
+
+          # ------------------------------------------------------------
+          # Severity mapping
+          # ------------------------------------------------------------
+
+          - set(attributes["level"], attributes["level"])
+            where attributes["level"] != nil
+
+          - set(severity_number, 5)
+            where attributes["level"] == "debug"
+
+          - set(severity_number, 9)
+            where attributes["level"] == "info"
+
+          - set(severity_number, 13)
+            where attributes["level"] == "warning" or attributes["level"] == "warn"
+
+          - set(severity_number, 17)
+            where attributes["level"] == "error"
+
+          - set(severity_text, attributes["level"])
+            where attributes["level"] != nil
+
+          # ------------------------------------------------------------
+          # service.name - service.instance - trace.id normalization
+          # ------------------------------------------------------------
+
+          - set(attributes["service.name"], "tyk.gateway")
+            where attributes["container_name"] != nil and IsMatch(attributes["container_name"], ".*tyk-gateway.*")
+
+          - set(attributes["service.instance"], attributes["container_name"])
+            where attributes["container_name"] != nil
+
+          - set(attributes["trace.id"], attributes["trace_id"])
+            where attributes["trace_id"] != nil
+
+          # ------------------------------------------------------------
+          # Normalize HTTP attributes
+          # ------------------------------------------------------------
+
+          - set(attributes["http.method"], attributes["method"])
+            where attributes["method"] != nil
+
+          - set(attributes["http.target"], attributes["path"])
+            where attributes["path"] != nil
+
+          - set(attributes["http.status_code"], attributes["status"])
+            where attributes["status"] != nil
+
+          - set(attributes["url.path"], attributes["path"])
+            where attributes["path"] != nil
+
+          # ------------------------------------------------------------
+          # Cleanup
+          # ------------------------------------------------------------
+
+          - delete_key(attributes, "msg")
+            where attributes["msg"] != nil
+          
+          # Delete trace_id 
+          - delete_key(attributes, "trace_id")
+            where attributes["trace_id"] != nil
+
+  filter/drop_noisy_logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        # Delete log heaths.
+        - 'severity_number <= 5 and IsMatch(body, ".*health.*")'
+        - 'severity_number <= 5 and IsMatch(body, ".*Primary instance.*")'
+        - 'IsMatch(body, "tyk-analytics=")'
+
+  transform/remove_sensitive:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - delete_key(attributes, "APIKey") where attributes["APIKey"] != nil
+          - delete_key(attributes, "IPAddress") where attributes["IPAddress"] != nil
+          - delete_key(attributes, "RawRequest") where attributes["RawRequest"] != nil
+          - delete_key(attributes, "RawResponse") where attributes["RawResponse"] != nil
+          - delete_key(attributes, "origin") where attributes["origin"] != nil
+    trace_statements:
+      - context: span
+        statements:
+          - delete_key(attributes, "http.request.header.authorization") where attributes["http.request.header.authorization"] != nil
+          - delete_key(attributes, "http.request.header.x-auth-token") where attributes["http.request.header.x-auth-token"] != nil
+          - delete_key(attributes, "http.response.header.set-cookie") where attributes["http.response.header.set-cookie"] != nil
+          - delete_key(attributes, "http.request.header.x-api-key") where attributes["http.request.header.x-api-key"] != nil
+
+  redaction:
+    allow_all_keys: true
+    blocked_values:
+      - "(?i)bearer\\s+[\\w.=_-]+"
+      - "^[a-f0-9]{64}$"
+    summary: debug
+
+  resource/logs:
+    attributes:
+      - key: log.source
+        value: docker-fluentd
+        action: upsert
+
+exporters:
+  otlphttp/newrelic:
+    endpoint: "https://otlp.eu01.nr-data.net"
+    headers:
+      api-key: "${NR_LICENSE_KEY}"
+    compression: gzip
+    tls:
+      insecure: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 100
+
+service:
+  
+  extensions: [health_check, pprof]
+
+  pipelines:
+
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - filter/drop_health_traces
+        - resource
+        - transform/remove_sensitive
+        - redaction
+        - batch/traces
+      exporters: [otlphttp/newrelic, spanmetrics]
+
+    metrics:
+      receivers: [redis, spanmetrics]
+      processors:
+        - memory_limiter
+        - resource
+        - batch/metrics
+      exporters: [otlphttp/newrelic]
+
+    logs:
+      
+      receivers: [fluentforward]
+      processors:
+        - memory_limiter
+        - transform/parse_tyk
+        - filter/drop_noisy_logs
+        - transform/remove_sensitive
+        - resource
+        - resource/logs
+        - batch/logs
+      exporters: [otlphttp/newrelic]
+
+  telemetry:
+    logs:
+      level: debug
+    metrics:
+      address: 0.0.0.0:8888

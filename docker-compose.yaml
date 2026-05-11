@@ -1,0 +1,87 @@
+name: ${COMPOSE_PROJECT_NAME}
+
+services:
+
+  tyk-redis:
+    image: redis:7.2-alpine
+    container_name: tyk-redis
+    networks:
+      - tyk-internal-net
+    ports:
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${OTEL_VERSION:-0.100.0}
+    container_name: otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    environment:
+      NR_LICENSE_KEY: ${NR_LICENSE_KEY}
+      NR_OTLP_ENDPOINT: ${NR_OTLP_ENDPOINT}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+    ports:
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+      - "8888:8888"    # Internal metrics
+      - "13133:13133"  # Health check
+      - "24224:24224"  # Fluent Forward → logs from Tyk Gateway
+    volumes:
+      - ./otel/config.yaml:/etc/otel/config.yaml:ro
+    networks:
+      - tyk-internal-net
+    #depends_on:
+      #tyk-redis:
+        #condition: service_healthy
+  tyk-gateway:
+    image: docker.tyk.io/tyk-gateway/tyk-gateway:${TYK_VERSION:-v5.12.0}
+    container_name: tyk-gateway
+    ports:
+      - "${TYK_PORT}:443"
+    environment:
+      TYK_GW_SECRET: ${TYK_SECRET}
+      TYK_GW_OPENTELEMETRY_ENABLED: ${TYK_GW_OTEL_ENABLED}
+      TYK_GW_OPENTELEMETRY_EXPORTER: ${TYK_GW_OTEL_EXPORTER}
+      TYK_GW_OPENTELEMETRY_ENDPOINT: ${TYK_GW_OTEL_ENDPOINT}
+      TYK_GW_OPENTELEMETRY_RESOURCENAME: ${TYK_GW_OTEL_RESOURCE_NAME}
+      TYK_GW_OPENTELEMETRY_CUSTOMTRACEHEADERS: ${TYK_GW_OTEL_CUSTOM_TRACE_HEADERS}
+      TYK_GW_OPENTELEMETRY_CONNECTIONTIMEOUT: ${TYK_GW_OPENTELEMETRY_CONNECTIONTIMEOUT}
+      TYK_GW_LOGFORMAT: ${TYK_GW_LOGFORMAT}
+      TYK_GW_LOGLEVEL: ${TYK_LOG_LEVEL}
+      TYK_GW_ACCESSLOGS_TEMPLATE: ${TYK_GW_ACCESSLOGS_TEMPLATE}
+      TYK_GW_ACCESSLOGS_ENABLED: ${TYK_GW_ACCESSLOGS_ENABLED}
+      TYK_GW_OPENTELEMETRY_CONTEXTPROPAGATION: ${TYK_GW_OTEL_CONTEXT_PROPAGATION}
+      TYK_GW_TRACK404LOGS: ${TYK_GW_TRACK404LOGS}
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        fluentd-async: "true"
+        fluentd-buffer-limit: "8388608"  # 8 MB buffer local
+        fluentd-retry-wait: "1s"
+        tag: "tyk.gateway"
+    volumes:
+      - ./tyk/tyk.conf:/opt/tyk-gateway/tyk.conf
+      - ./tyk/apps:/opt/tyk-gateway/apps
+      - ./tyk/middleware:/opt/tyk-gateway/middleware
+      - ./tyk/policies:/opt/tyk-gateway/policies
+      - ./tyk/certs:/opt/tyk-gateway/certs:ro
+    depends_on:
+      tyk-redis:
+         condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - tyk-internal-net
+      - tyk-public-net
+networks:
+  tyk-public-net:
+    driver: bridge
+    name: tyk-public-network
+  tyk-internal-net:
+    driver: bridge
+    name: tyk-internal-network

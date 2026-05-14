@@ -1,8 +1,13 @@
 #!/bin/bash
 # generate-load.sh — ejecutar ANTES de la PoC
 
-URL="https://tyk-poc.westeurope.cloudapp.azure.com/api-users/v1/users"
-TOKEN="Basic YWRtaW46YWRtaW4="  # admin:admin codificado en Base64
+#!/bin/bash
+set -e
+
+source .credentials.tyk.env
+
+URL= $URL_GW_USERS
+TOKEN= $BASIC_GW_USERS
 COUNT=20
 
 echo "Enviando $COUNT peticiones a $URL..."

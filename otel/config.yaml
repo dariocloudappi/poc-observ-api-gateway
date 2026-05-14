@@ -5,9 +5,10 @@
 connectors:
   spanmetrics:
     histogram:
-      explicit:
-        # Buckets ajustados a latencias reales de API — no buckets genéricos
-        buckets: [10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s]
+      exponential:
+        max_size: 160
+    exemplars:
+      enabled: false
     dimensions:
       - name: http.method
       - name: http.status_code
@@ -17,9 +18,10 @@ connectors:
       - name: tyk.api.name
       - name: http.target
       #- name: service.name
-    namespace: gw
+    namespace: tyk-gw-v2
     # Limitar cardinalidad — crítico en producción
     metrics_flush_interval: 60s
+    aggregation_temporality: "AGGREGATION_TEMPORALITY_DELTA"  # ← clave para métricas de alta cardinalidad
 
 extensions:
   health_check:
@@ -41,13 +43,13 @@ receivers:
   redis:
     endpoint: "tyk-redis:6379"
     #endpoint: "172.18.0.1:6379"
-    collection_interval: 30s  # 10s es excesivo para Redis en producción
+    collection_interval: 30s
 
 
 processors:
   memory_limiter:
     check_interval: 1s
-    limit_mib: 400        # más conservador — deja margen al SO
+    limit_mib: 400
     spike_limit_mib: 100
 
   # Batch diferenciado por señal — logs necesitan menor latencia que métricas

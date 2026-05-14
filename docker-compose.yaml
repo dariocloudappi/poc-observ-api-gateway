@@ -25,7 +25,7 @@ services:
       NR_OTLP_ENDPOINT: ${NR_OTLP_ENDPOINT}
       ENVIRONMENT: ${ENVIRONMENT:-local}
     ports:
-      - "4317:4317"    # OTLP gRPC
+      - "5055:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
       - "8888:8888"    # Internal metrics
       - "13133:13133"  # Health check

@@ -1,16 +1,14 @@
 {
   "name": "microservice-orders",
-  "slug": "microservice-orders", 
+  "slug": "microservice-orders",
   "api_id": "microservice-orders-001",
-  "org_id": "poc-organization",
+  "org_id": "%%TYK_ORG_ID%%",
   "use_keyless": false,
-  "detailed_tracing": true,
+  "detailed_tracing": %%TYK_DETAILED_TRACING%%,
   "use_basic_auth": true,
-
   "auth": {
     "auth_header_name": "Authorization"
   },
-  
   "version_data": {
     "not_versioned": true,
     "versions": {
@@ -18,20 +16,16 @@
         "name": "Default",
         "use_extended_paths": true,
         "global_headers": {
-          "Authorization": "Basic MDk0N2NlMjItN2NjNi00NTMwLThlMWQtZWU1NTNhZGM0YTI0OmFmM2JjZDUxLTJkZjItNDI5NS1hMjE3LWQyNDJkYjBjZTQ0Mg=="
+          "Authorization": "%%UPSTREAM_ORDERS_AUTH_HEADER%%"
         },
-        "extended_paths": {
-        }
+        "extended_paths": {}
       }
     }
   },
   "proxy": {
     "listen_path": "/api-orders/v1",
-    "target_url": "https://poc-microservice-orders-dgc0e4erbkg4fzam.westus2-01.azurewebsites.net",
+    "target_url": "%%UPSTREAM_ORDERS_TARGET_URL%%",
     "strip_listen_path": true
   },
-
-
-  
   "active": true
 }

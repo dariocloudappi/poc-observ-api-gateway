@@ -1,0 +1,13 @@
+# Keep secrets and local material out of the build context.
+.git
+.github
+.env
+.env.*
+!.env.example
+.credentials.tyk.env
+tyk/certs
+docs
+infra
+*.md
+*.pem
+*.key

@@ -1,0 +1,358 @@
+# =============================================================================
+# deploy.yml - build and deploy the Tyk OSS PoC to Azure Container Apps
+# -----------------------------------------------------------------------------
+# Authentication uses OIDC federated credentials: there is no client secret
+# stored anywhere. Every sensitive value comes from GitHub Secrets and is
+# passed to Bicep through environment variables, so it never appears in the
+# command line, in a file of the repository or in the logs.
+# =============================================================================
+
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      auto_destroy_minutes:
+        description: 'Minutes before the resource group is deleted automatically. 0 disables the automatic cleanup'
+        required: false
+        default: '60'
+      provision_keys:
+        description: 'Create the consumer keys in the gateway after the deployment'
+        required: false
+        default: 'true'
+      observability_enabled:
+        description: 'Deploy the Tyk Pump and OpenTelemetry Collector sidecars'
+        required: false
+        default: 'true'
+
+# OIDC needs id-token write. Nothing else is required.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-tyk-poc
+  cancel-in-progress: false
+
+env:
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'westeurope' }}
+  POC_NAME_PREFIX: ${{ vars.POC_NAME_PREFIX || 'tykpoc' }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-tykpoc' }}
+  POC_OWNER: ${{ vars.POC_OWNER || 'unknown' }}
+  POC_TTL: ${{ vars.POC_TTL || '1h' }}
+  LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS || '30' }}
+  LOG_DAILY_QUOTA_GB: ${{ vars.LOG_DAILY_QUOTA_GB || '1' }}
+  ENABLE_ACTIVITY_LOG_EXPORT: ${{ vars.ENABLE_ACTIVITY_LOG_EXPORT || 'true' }}
+  ENABLE_LOG_ANALYTICS: ${{ vars.ENABLE_LOG_ANALYTICS || 'true' }}
+  NR_EXCLUDE_PLATFORM_LOGS: ${{ vars.NR_EXCLUDE_PLATFORM_LOGS || 'false' }}
+  ASSIGN_ACR_PULL_ROLE: ${{ vars.ASSIGN_ACR_PULL_ROLE || 'true' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'poc' }}
+  SERVICE_NAMESPACE: ${{ vars.SERVICE_NAMESPACE || 'poc-observability' }}
+  NR_OTLP_ENDPOINT: ${{ vars.NR_OTLP_ENDPOINT || 'https://otlp.eu01.nr-data.net:4318' }}
+  TYK_VERSION: ${{ vars.TYK_VERSION || 'v5.12.0' }}
+  TYK_PUMP_VERSION: ${{ vars.TYK_PUMP_VERSION || 'v1.12.0' }}
+  OTEL_VERSION: ${{ vars.OTEL_VERSION || '0.100.0' }}
+  UPSTREAM_USERS_TARGET_URL: ${{ vars.UPSTREAM_USERS_TARGET_URL }}
+  UPSTREAM_ORDERS_TARGET_URL: ${{ vars.UPSTREAM_ORDERS_TARGET_URL }}
+
+jobs:
+
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    outputs:
+      gateway_url: ${{ steps.app.outputs.url }}
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Mask every secret that is going to travel through the job, so an
+      # accidental echo cannot leak it into the logs.
+      - name: Mask sensitive values
+        env:
+          TYK_SECRET: ${{ secrets.TYK_SECRET }}
+          TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
+          NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
+          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
+          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
+          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
+          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
+        run: |
+          for name in TYK_SECRET TYK_NODE_SECRET NR_LICENSE_KEY \
+                      UPSTREAM_USERS_BASIC_USER UPSTREAM_USERS_BASIC_PASSWORD \
+                      UPSTREAM_ORDERS_BASIC_USER UPSTREAM_ORDERS_BASIC_PASSWORD; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "ERROR: required secret $name is not configured in the repository" >&2
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+          echo "All required secrets are present."
+
+      - name: Validate non secret configuration
+        run: |
+          if [ -z "$UPSTREAM_USERS_TARGET_URL" ] || [ -z "$UPSTREAM_ORDERS_TARGET_URL" ]; then
+            echo "ERROR: repository variables UPSTREAM_USERS_TARGET_URL and UPSTREAM_ORDERS_TARGET_URL must be set" >&2
+            exit 1
+          fi
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      # ---------------------------------------------------------------------
+      # Stage 1: resource group, Log Analytics, registry, identity, environment
+      # ---------------------------------------------------------------------
+      - name: Deploy foundation
+        id: foundation
+        run: |
+          set -euo pipefail
+          # The .bicepparam file declares its own template through "using",
+          # so --template-file must not be passed here.
+          outputs=$(az deployment sub create \
+            --name "foundation-${GITHUB_RUN_ID}" \
+            --location "$AZURE_LOCATION" \
+            --parameters infra/main.bicepparam \
+            --query properties.outputs -o json)
+
+          echo "acr_name=$(echo "$outputs" | jq -r .acrName.value)" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$(echo "$outputs" | jq -r .acrLoginServer.value)" >> "$GITHUB_OUTPUT"
+          echo "cae_name=$(echo "$outputs" | jq -r .managedEnvironmentName.value)" >> "$GITHUB_OUTPUT"
+          echo "identity_id=$(echo "$outputs" | jq -r .managedIdentityId.value)" >> "$GITHUB_OUTPUT"
+          echo "workspace_name=$(echo "$outputs" | jq -r .logAnalyticsWorkspaceName.value)" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Stage 2: images
+      # ---------------------------------------------------------------------
+      - name: Log in to the container registry
+        run: az acr login --name "${{ steps.foundation.outputs.acr_name }}"
+
+      - name: Build and push images
+        id: images
+        env:
+          ACR: ${{ steps.foundation.outputs.acr_login_server }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_SHA::12}"
+
+          docker build \
+            --file docker/gateway.Dockerfile \
+            --build-arg "TYK_VERSION=${TYK_VERSION}" \
+            --tag "${ACR}/tyk-gateway:${TAG}" .
+
+          docker build \
+            --file docker/pump.Dockerfile \
+            --build-arg "TYK_PUMP_VERSION=${TYK_PUMP_VERSION}" \
+            --tag "${ACR}/tyk-pump:${TAG}" .
+
+          docker build \
+            --file docker/otel.Dockerfile \
+            --build-arg "OTEL_VERSION=${OTEL_VERSION}" \
+            --tag "${ACR}/otel-collector:${TAG}" .
+
+          docker push "${ACR}/tyk-gateway:${TAG}"
+          docker push "${ACR}/tyk-pump:${TAG}"
+          docker push "${ACR}/otel-collector:${TAG}"
+
+          echo "gateway=${ACR}/tyk-gateway:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "pump=${ACR}/tyk-pump:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "otel=${ACR}/otel-collector:${TAG}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Stage 3: workload
+      # ---------------------------------------------------------------------
+      # Secrets are exported as environment variables and read by the
+      # bicepparam file, so they never appear as command line arguments.
+      - name: Deploy container app
+        id: app
+        env:
+          AZURE_CAE_NAME: ${{ steps.foundation.outputs.cae_name }}
+          AZURE_IDENTITY_ID: ${{ steps.foundation.outputs.identity_id }}
+          AZURE_ACR_LOGIN_SERVER: ${{ steps.foundation.outputs.acr_login_server }}
+          IMAGE_GATEWAY: ${{ steps.images.outputs.gateway }}
+          IMAGE_PUMP: ${{ steps.images.outputs.pump }}
+          IMAGE_OTEL: ${{ steps.images.outputs.otel }}
+          OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
+          GATEWAY_USE_LOGSTASH: ${{ vars.GATEWAY_USE_LOGSTASH || 'true' }}
+          TYK_ENABLE_DETAILED_RECORDING: ${{ vars.TYK_ENABLE_DETAILED_RECORDING || 'false' }}
+          TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'info' }}
+          TYK_SECRET: ${{ secrets.TYK_SECRET }}
+          TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
+          NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
+          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
+          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
+          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
+          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Bicep resolves readEnvironmentVariable at compile time, so an empty
+          # value would reach the template silently. Fail here with a clear
+          # message instead.
+          for name in AZURE_CAE_NAME AZURE_IDENTITY_ID AZURE_ACR_LOGIN_SERVER \
+                      IMAGE_GATEWAY IMAGE_PUMP IMAGE_OTEL \
+                      UPSTREAM_USERS_TARGET_URL UPSTREAM_ORDERS_TARGET_URL; do
+            if [ -z "${!name:-}" ]; then
+              echo "ERROR: ${name} is empty. The foundation stage did not return it." >&2
+              exit 1
+            fi
+          done
+
+          outputs=$(az deployment group create \
+            --name "app-${GITHUB_RUN_ID}" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --parameters infra/app.bicepparam \
+            --query properties.outputs -o json)
+
+          url=$(echo "$outputs" | jq -r .url.value)
+          fqdn=$(echo "$outputs" | jq -r .fqdn.value)
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          echo "fqdn=${fqdn}" >> "$GITHUB_OUTPUT"
+          echo "Gateway published at ${url}"
+
+      # ---------------------------------------------------------------------
+      # Stage 4: smoke tests over HTTPS
+      # ---------------------------------------------------------------------
+      - name: Smoke test - gateway health over HTTPS
+        env:
+          URL: ${{ steps.app.outputs.url }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for ${URL}/hello ..."
+          for attempt in $(seq 1 40); do
+            body=$(curl --silent --show-error --max-time 10 "${URL}/hello" || true)
+            if echo "$body" | grep -q "pass"; then
+              echo "Gateway is healthy after ${attempt} attempt(s)."
+              echo "$body"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ERROR: the gateway did not answer /hello over HTTPS" >&2
+          exit 1
+
+      - name: Smoke test - TLS is enforced and certificate is valid
+        env:
+          FQDN: ${{ steps.app.outputs.fqdn }}
+        run: |
+          set -euo pipefail
+          # curl validates the certificate chain by default: no --insecure here.
+          tls_version=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{ssl_verify_result} %{http_version}' "https://${FQDN}/hello")
+          echo "ssl_verify_result and http_version: ${tls_version}"
+
+          # Plain HTTP must not serve content: the ingress redirects to HTTPS.
+          code=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://${FQDN}/hello")
+          echo "Plain HTTP returned ${code}"
+          case "$code" in
+            30*|403|404) echo "Plain HTTP is not served, as expected." ;;
+            200) echo "ERROR: the gateway answered over plain HTTP" >&2; exit 1 ;;
+            *) echo "Unexpected status ${code} over plain HTTP" ;;
+          esac
+
+      - name: Smoke test - APIs reject anonymous traffic
+        env:
+          URL: ${{ steps.app.outputs.url }}
+        run: |
+          set -euo pipefail
+          for path in /api-users/v1 /api-orders/v1; do
+            code=$(curl --silent --output /dev/null --write-out '%{http_code}' "${URL}${path}")
+            echo "${path} without credentials returned ${code}"
+            if [ "$code" != "401" ] && [ "$code" != "400" ]; then
+              echo "ERROR: ${path} should reject anonymous requests" >&2
+              exit 1
+            fi
+          done
+
+      # ---------------------------------------------------------------------
+      # Stage 5: optional consumer key provisioning
+      # ---------------------------------------------------------------------
+      - name: Provision consumer keys
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.provision_keys == 'true' }}
+        env:
+          GATEWAY_BASE_URL: ${{ steps.app.outputs.url }}
+          GATEWAY_ALLOW_INSECURE_TLS: 'false'
+          TYK_SECRET: ${{ secrets.TYK_SECRET }}
+          TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
+          USERNAME_API_USERS: ${{ secrets.USERNAME_API_USERS }}
+          PASSWORD_API_USERS: ${{ secrets.PASSWORD_API_USERS }}
+          USERNAME_API_ORDERS: ${{ secrets.USERNAME_API_ORDERS }}
+          PASSWORD_API_ORDERS: ${{ secrets.PASSWORD_API_ORDERS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${USERNAME_API_USERS}" ] && [ -z "${USERNAME_API_ORDERS}" ]; then
+            echo "No consumer credentials configured, skipping key provisioning."
+            exit 0
+          fi
+          echo "::add-mask::${PASSWORD_API_USERS}"
+          echo "::add-mask::${PASSWORD_API_ORDERS}"
+          chmod +x ./provision_key.sh
+          ./provision_key.sh
+
+      - name: Deployment summary
+        if: always()
+        env:
+          URL: ${{ steps.app.outputs.url }}
+          WORKSPACE: ${{ steps.foundation.outputs.workspace_name }}
+        run: |
+          {
+            echo "## Tyk OSS PoC deployed"
+            echo
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Gateway URL | ${URL} |"
+            echo "| Resource group | ${AZURE_RESOURCE_GROUP} |"
+            echo "| Log Analytics workspace | ${WORKSPACE} |"
+            echo "| Region | ${AZURE_LOCATION} |"
+            echo "| Image tag | ${GITHUB_SHA::12} |"
+            echo
+            echo "Remember to run the destroy workflow when the PoC is over."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Automatic cleanup. Keeps the PoC from generating residual cost if somebody
+  # forgets to run destroy.yml. Cancelling this run cancels the cleanup.
+  # -------------------------------------------------------------------------
+  auto-destroy:
+    name: Automatic cleanup
+    needs: deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_destroy_minutes != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+
+      - name: Wait for the configured TTL
+        env:
+          MINUTES: ${{ inputs.auto_destroy_minutes }}
+        run: |
+          set -euo pipefail
+          echo "Waiting ${MINUTES} minute(s) before deleting ${AZURE_RESOURCE_GROUP}."
+          sleep "$(( MINUTES * 60 ))"
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete the resource group
+        run: |
+          set -euo pipefail
+          echo "Deleting resource group ${AZURE_RESOURCE_GROUP}"
+          az group delete --name "$AZURE_RESOURCE_GROUP" --yes
+          echo "Resource group deleted."

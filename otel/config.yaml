@@ -1,5 +1,21 @@
 # =============================================================================
-# OTel Collector — producción optimizada
+# OpenTelemetry Collector - Tyk OSS to New Relic
+# -----------------------------------------------------------------------------
+# Every environment specific value is resolved from environment variables:
+#   NR_LICENSE_KEY            New Relic ingest license key (secret)
+#   NR_OTLP_ENDPOINT          New Relic OTLP endpoint, e.g. https://otlp.eu01.nr-data.net:4318
+#   ENVIRONMENT               deployment.environment resource attribute
+#   SERVICE_NAMESPACE         service.namespace resource attribute
+#   REDIS_ENDPOINT            host:port of the Redis instance to scrape
+#   TYK_PUMP_METRICS_ENDPOINT host:port of the Tyk Pump prometheus pump
+#   OTEL_TELEMETRY_LOG_LEVEL  collector self-telemetry log level
+#
+# Log intake works in two modes, both always listening:
+#   - fluentforward (24224): used by docker compose locally through the
+#     fluentd logging driver.
+#   - tcplog (5170): used in Azure Container Apps, fed by the Tyk gateway
+#     logstash transport, because the container runtime is not under our
+#     control there.
 # =============================================================================
 
 connectors:
@@ -12,26 +28,37 @@ connectors:
     dimensions:
       - name: http.method
       - name: http.status_code
-      # http.route solo si tus APIs NO tienen path params dinámicos
-      # Si tienes /users/{id} usa http.target normalizado o elimínalo
+      # http.route only if the APIs do not use dynamic path params.
       - name: http.route
       - name: tyk.api.name
       - name: http.target
-      #- name: service.name
-    namespace: tyk-gw-v2
-    # Limitar cardinalidad — crítico en producción
+    # Prefix of the generated metric names: tyk.gateway.calls and
+    # tyk.gateway.duration. Dots because that is the OTel convention for metric
+    # names, while the service.name of the gateway is tyk-gateway. Same words in
+    # both, so the metrics are findable from the name used in traces and logs.
+    namespace: tyk.gateway
+    # Cardinality control matters more than resolution here.
     metrics_flush_interval: 60s
-    aggregation_temporality: "AGGREGATION_TEMPORALITY_DELTA"  # ← clave para métricas de alta cardinalidad
+    aggregation_temporality: "AGGREGATION_TEMPORALITY_DELTA"
 
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
   pprof:
-    endpoint: 127.0.0.1:1777  # solo loopback en producción
+    endpoint: 127.0.0.1:1777
 
 receivers:
+
+  # Local mode: docker fluentd logging driver.
   fluentforward:
     endpoint: 0.0.0.0:24224
+
+  # Azure mode: Tyk gateway logstash transport (one JSON document per line).
+  tcplog/tyk:
+    listen_address: 0.0.0.0:5170
+    add_attributes: false
+    attributes:
+      log.source: tyk-logstash
 
   otlp:
     protocols:
@@ -41,37 +68,60 @@ receivers:
         endpoint: 0.0.0.0:4318
 
   redis:
-    endpoint: "tyk-redis:6379"
-    #endpoint: "172.18.0.1:6379"
+    endpoint: "${env:REDIS_ENDPOINT}"
     collection_interval: 30s
 
+  # Tyk Pump prometheus pump: per API traffic analytics.
+  prometheus/tykpump:
+    config:
+      scrape_configs:
+        - job_name: tyk-pump
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["${env:TYK_PUMP_METRICS_ENDPOINT}"]
+
+  # Self telemetry of the collector, exposed by service.telemetry.metrics below.
+  # Without this nobody watches the watcher: a full sending queue, a rejected
+  # export or a memory_limiter kicking in would silently drop data and the only
+  # symptom would be missing telemetry, which is exactly what you cannot see.
+  prometheus/collector:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
 
 processors:
+
   memory_limiter:
     check_interval: 1s
     limit_mib: 400
     spike_limit_mib: 100
 
-  # Batch diferenciado por señal — logs necesitan menor latencia que métricas
+  # Batching is tuned per signal: logs need lower latency than metrics.
   batch/traces:
     timeout: 5s
     send_batch_size: 512
     send_batch_max_size: 1024
 
   batch/metrics:
-    timeout: 30s          # métricas toleran más latencia
+    timeout: 30s
     send_batch_size: 512
     send_batch_max_size: 1024
 
   batch/logs:
     timeout: 5s
-    send_batch_size: 256  # logs más pequeños, batch más pequeño
+    send_batch_size: 256
     send_batch_max_size: 512
 
   resource:
     attributes:
       - key: deployment.environment
-        value: "${ENVIRONMENT}"
+        value: "${env:ENVIRONMENT}"
+        action: upsert
+      - key: service.namespace
+        value: "${env:SERVICE_NAMESPACE}"
         action: upsert
       - key: cloud.provider
         value: azure
@@ -83,6 +133,7 @@ processors:
       span:
         - 'attributes["http.route"] == "/health"'
         - 'attributes["http.route"] == "/healthz"'
+        - 'attributes["http.route"] == "/hello"'
         - 'IsMatch(attributes["http.url"], ".*/health.*")'
 
   transform/parse_tyk:
@@ -92,25 +143,16 @@ processors:
         statements:
 
           # ------------------------------------------------------------
-          # Parse JSON in body,
+          # Parse the JSON payload emitted by the gateway
           # ------------------------------------------------------------
 
           - merge_maps(attributes, ParseJSON(body), "upsert")
             where body != nil and IsMatch(body, "^\\{")
 
-
           # ------------------------------------------------------------
-          # Extract trace_id and span_id from attributes if exist
+          # Rebuild a readable message for access log records
           # ------------------------------------------------------------
-          #- set(trace_id, attributes["trace_id"])
-            #where attributes["trace_id"] != nil
 
-          #- set(span_id, attributes["span_id"])
-            #where attributes["span_id"] != nil
-
-          # if the body is empty and exist propertie type in body with value "request" build the strcture msg
-          # <type>: <method> <path> <status> latency_total=<latency_total> latency_gateway=<latency_gateway> upstream_latency=<upstream_latency> trace_id=<trace_id>
-          
           - >-
             set(body, Concat([attributes["type"], ": ",
             attributes["method"], " ", attributes["path"], " ",
@@ -120,13 +162,9 @@ processors:
             and attributes["path"] != nil
             and attributes["status"] != nil
 
-
           # ------------------------------------------------------------
           # Severity mapping
           # ------------------------------------------------------------
-
-          - set(attributes["level"], attributes["level"])
-            where attributes["level"] != nil
 
           - set(severity_number, 5)
             where attributes["level"] == "debug"
@@ -144,13 +182,24 @@ processors:
             where attributes["level"] != nil
 
           # ------------------------------------------------------------
-          # service.name - service.instance - trace.id normalization
+          # service.name, service.instance.id and trace correlation
+          # -----------------------------------------------------------
+          # The value MUST be the same one the gateway reports on its spans
+          # through TYK_GW_OPENTELEMETRY_RESOURCENAME, which is "tyk-gateway".
+          # With a different spelling New Relic resolves two separate entities,
+          # the "See logs" link of a span finds nothing, and any NRQL joining
+          # Span and Log by service.name silently returns empty.
           # ------------------------------------------------------------
 
-          - set(attributes["service.name"], "tyk.gateway")
+          - set(attributes["service.name"], "tyk-gateway")
             where attributes["container_name"] != nil and IsMatch(attributes["container_name"], ".*tyk-gateway.*")
 
-          - set(attributes["service.instance"], attributes["container_name"])
+          - set(attributes["service.name"], "tyk-gateway")
+            where attributes["service.name"] == nil
+
+          # service.instance.id is the semantic convention attribute. Named
+          # service.instance it is just a custom attribute nothing consumes.
+          - set(attributes["service.instance.id"], attributes["container_name"])
             where attributes["container_name"] != nil
 
           - set(attributes["trace.id"], attributes["trace_id"])
@@ -173,13 +222,26 @@ processors:
             where attributes["path"] != nil
 
           # ------------------------------------------------------------
+          # Audit trail: keep enough context to answer who, what and when
+          # without leaking the API key itself. Only the last 4 characters
+          # of the key identifier are kept.
+          # ------------------------------------------------------------
+
+          - >-
+            set(attributes["auth.key_suffix"],
+            Substring(attributes["api_key"], Len(attributes["api_key"]) - 4, 4))
+            where attributes["api_key"] != nil and Len(attributes["api_key"]) > 8
+
+          - delete_key(attributes, "api_key")
+            where attributes["api_key"] != nil
+
+          # ------------------------------------------------------------
           # Cleanup
           # ------------------------------------------------------------
 
           - delete_key(attributes, "msg")
             where attributes["msg"] != nil
-          
-          # Delete trace_id 
+
           - delete_key(attributes, "trace_id")
             where attributes["trace_id"] != nil
 
@@ -187,7 +249,7 @@ processors:
     error_mode: ignore
     logs:
       log_record:
-        # Delete log heaths.
+        # Health probe noise and gateway internal chatter.
         - 'severity_number <= 5 and IsMatch(body, ".*health.*")'
         - 'severity_number <= 5 and IsMatch(body, ".*Primary instance.*")'
         - 'IsMatch(body, "tyk-analytics=")'
@@ -202,6 +264,7 @@ processors:
           - delete_key(attributes, "RawRequest") where attributes["RawRequest"] != nil
           - delete_key(attributes, "RawResponse") where attributes["RawResponse"] != nil
           - delete_key(attributes, "origin") where attributes["origin"] != nil
+          - delete_key(attributes, "Authorization") where attributes["Authorization"] != nil
     trace_statements:
       - context: span
         statements:
@@ -214,20 +277,63 @@ processors:
     allow_all_keys: true
     blocked_values:
       - "(?i)bearer\\s+[\\w.=_-]+"
+      - "(?i)basic\\s+[A-Za-z0-9+/=]+"
       - "^[a-f0-9]{64}$"
     summary: debug
 
   resource/logs:
     attributes:
       - key: log.source
-        value: docker-fluentd
+        value: tyk-gateway
+        action: insert
+
+  # -------------------------------------------------------------------------
+  # One service.name per component of the container app
+  # -------------------------------------------------------------------------
+  # The metrics pipelines are split by source precisely so each one can be
+  # stamped here: a processor applies to everything that crosses its pipeline,
+  # so a single shared metrics pipeline cannot give different names to Redis,
+  # the pump and the collector.
+  #
+  # Without these, Redis metrics arrive with NO service.name at all and land in
+  # New Relic as an unnamed entity, and the pump gets its name by accident from
+  # the Prometheus job_name instead of by decision.
+  #
+  # All of them keep the same service.namespace, so they stay grouped together
+  # as components of one gateway even though they are separate entities.
+
+  resource/redis:
+    attributes:
+      - key: service.name
+        value: tyk-redis
+        action: upsert
+      - key: service.instance.id
+        value: tyk-redis
+        action: upsert
+
+  resource/tykpump:
+    attributes:
+      - key: service.name
+        value: tyk-pump
+        action: upsert
+      - key: service.instance.id
+        value: tyk-pump
+        action: upsert
+
+  resource/collector:
+    attributes:
+      - key: service.name
+        value: otel-collector
+        action: upsert
+      - key: service.instance.id
+        value: otel-collector
         action: upsert
 
 exporters:
   otlphttp/newrelic:
-    endpoint: "https://otlp.eu01.nr-data.net"
+    endpoint: "${env:NR_OTLP_ENDPOINT}"
     headers:
-      api-key: "${NR_LICENSE_KEY}"
+      api-key: "${env:NR_LICENSE_KEY}"
     compression: gzip
     tls:
       insecure: false
@@ -242,7 +348,7 @@ exporters:
       queue_size: 100
 
 service:
-  
+
   extensions: [health_check, pprof]
 
   pipelines:
@@ -258,22 +364,55 @@ service:
         - batch/traces
       exporters: [otlphttp/newrelic, spanmetrics]
 
-    metrics:
-      receivers: [redis, spanmetrics]
+    # One pipeline per source, so each component can be named explicitly.
+    # Splitting is not cosmetic: a processor cannot distinguish which receiver
+    # a metric came from, so a shared pipeline can only apply one name.
+
+    # Derived from the gateway spans, so it already carries
+    # service.name = tyk-gateway from the traces resource.
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
       processors:
         - memory_limiter
         - resource
         - batch/metrics
       exporters: [otlphttp/newrelic]
 
+    metrics/redis:
+      receivers: [redis]
+      processors:
+        - memory_limiter
+        - resource
+        - resource/redis
+        - batch/metrics
+      exporters: [otlphttp/newrelic]
+
+    metrics/tykpump:
+      receivers: [prometheus/tykpump]
+      processors:
+        - memory_limiter
+        - resource
+        - resource/tykpump
+        - batch/metrics
+      exporters: [otlphttp/newrelic]
+
+    metrics/collector:
+      receivers: [prometheus/collector]
+      processors:
+        - memory_limiter
+        - resource
+        - resource/collector
+        - batch/metrics
+      exporters: [otlphttp/newrelic]
+
     logs:
-      
-      receivers: [fluentforward]
+      receivers: [fluentforward, tcplog/tyk]
       processors:
         - memory_limiter
         - transform/parse_tyk
         - filter/drop_noisy_logs
         - transform/remove_sensitive
+        - redaction
         - resource
         - resource/logs
         - batch/logs
@@ -281,6 +420,6 @@ service:
 
   telemetry:
     logs:
-      level: debug
+      level: "${env:OTEL_TELEMETRY_LOG_LEVEL}"
     metrics:
       address: 0.0.0.0:8888

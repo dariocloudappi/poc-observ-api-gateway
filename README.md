@@ -26,11 +26,24 @@ El PoC son **tres repositorios** con dependencias en cadena, y el orden no es op
 
 ```
 1. poc-microservice-users      (no depende de nadie)
-        ↓  su URL y sus credenciales
-2. poc-microservice-orders     (valida cada pedido contra users)
-        ↓  las URLs y credenciales de los dos
+        ↓  su URL
+2. poc-microservice-orders     (primer despliegue, SIN GATEWAY_BASE_URL)
+        ↓  las URLs de los dos
 3. poc-tyk-api-gateway         (este repositorio)
+        ↓  el FQDN del gateway
+4. poc-microservice-orders     (segundo despliegue, ya con GATEWAY_BASE_URL)
 ```
+
+**Por qué orders se despliega dos veces.** Orders valida cada pedido contra users **a través de
+este gateway**, no directamente. Eso cierra un ciclo: el gateway necesita la URL de orders para
+enrutar hacia él, y orders necesita la URL del gateway para llamar a users. Se rompe dejando que
+orders arranque sin la URL del gateway en el paso 2: se despliega, y sus endpoints de pedidos
+devuelven `503` hasta el paso 4. Su pipeline lo avisa con un warning en lugar de fallar.
+
+Consecuencia para este repositorio: **orders es a la vez upstream y consumidor**. Como upstream lo
+alcanzas por `UPSTREAM_ORDERS_*`; como consumidor usa las credenciales
+`USERNAME_API_USERS` / `PASSWORD_API_USERS`, las mismas que cualquier otro cliente de
+`/api-users/v1`.
 
 ### Qué tienes que tener antes de lanzar este pipeline
 
@@ -39,7 +52,7 @@ El PoC son **tres repositorios** con dependencias en cadena, y el orden no es op
 | URL de users | Salida del deploy de `poc-microservice-users` | Variable `UPSTREAM_USERS_TARGET_URL` |
 | Credenciales de users | Secrets `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` de ese repositorio | Secrets `UPSTREAM_USERS_BASIC_USER` / `UPSTREAM_USERS_BASIC_PASSWORD` |
 | URL de orders | Salida del deploy de `poc-microservice-orders` | Variable `UPSTREAM_ORDERS_TARGET_URL` |
-| Credenciales de orders | Secrets `API_USERNAME` / `API_PASSWORD` de ese repositorio | Secrets `UPSTREAM_ORDERS_BASIC_USER` / `UPSTREAM_ORDERS_BASIC_PASSWORD` |
+| Credenciales de orders | Secrets `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` de ese repositorio | Secrets `UPSTREAM_ORDERS_BASIC_USER` / `UPSTREAM_ORDERS_BASIC_PASSWORD` |
 
 Las credenciales tienen que **coincidir exactamente**: son las que los microservicios exigen a
 quien les llama. Si no coinciden, el gateway responde `200` en su health check pero devuelve
@@ -190,7 +203,6 @@ PostgreSQL.
 .
 ├── .github/workflows/
 │   ├── deploy.yml            Build + despliegue + smoke tests + auto-limpieza
-│   └── destroy.yml           Borrado manual y limpieza programada de PoCs caducados
 ├── docker/
 │   ├── gateway.Dockerfile    Imagen del gateway con las plantillas de API
 │   ├── gateway-entrypoint.sh Renderiza las definiciones de API desde variables de entorno
@@ -317,8 +329,8 @@ fichero versionado.**
 | `UPSTREAM_USERS_BASIC_USER` | **Secreto.** Usuario Basic Auth del upstream de usuarios | `BASIC_AUTH_USER` en `poc-microservice-users` |
 | `UPSTREAM_USERS_BASIC_PASSWORD` | **Secreto.** Contraseña del upstream de usuarios | `BASIC_AUTH_PASSWORD` en `poc-microservice-users` |
 | `UPSTREAM_ORDERS_TARGET_URL` | URL del microservicio de pedidos, sin barra final | La Web App de `poc-microservice-orders` |
-| `UPSTREAM_ORDERS_BASIC_USER` | **Secreto.** Usuario Basic Auth del upstream de pedidos | `API_USERNAME` en `poc-microservice-orders` |
-| `UPSTREAM_ORDERS_BASIC_PASSWORD` | **Secreto.** Contraseña del upstream de pedidos | `API_PASSWORD` en `poc-microservice-orders` |
+| `UPSTREAM_ORDERS_BASIC_USER` | **Secreto.** Usuario Basic Auth del upstream de pedidos | `BASIC_AUTH_USER` en `poc-microservice-orders` |
+| `UPSTREAM_ORDERS_BASIC_PASSWORD` | **Secreto.** Contraseña del upstream de pedidos | `BASIC_AUTH_PASSWORD` en `poc-microservice-orders` |
 
 Los dos microservicios tienen que estar desplegados antes: ver
 [orden de despliegue del PoC](#0-orden-de-despliegue-del-poc).
@@ -517,9 +529,9 @@ Si no es posible conceder el rol de administración de RBAC, pon la variable de 
 | `ENABLE_ACTIVITY_LOG_EXPORT` | Exportar el Activity Log de la suscripción al workspace. Es el único de los tres repositorios que lo trae en `true`: el Activity Log es de suscripción y solo debe exportarlo uno | `true` |
 | `ENABLE_LOG_ANALYTICS` | Crear los Diagnostic Settings hacia Log Analytics. Ponlo a `false` cuando el servicio nativo de New Relic ya reenvíe los logs de plataforma, para no ingerir el mismo dato dos veces. Con `false`, los logs de consola tampoco se copian al workspace | `true` |
 | `NR_EXCLUDE_PLATFORM_LOGS` | Etiqueta el Container Apps Environment con `newrelicLogs=exclude`. **Déjalo en `false`** salvo que veas las líneas del gateway duplicadas: la exclusión aplica a todo el entorno y silenciaría también a Redis, al pump y al colector, que no tienen otra vía hacia New Relic | `false` |
+| `TYK_DETAILED_TRACING` | Un span por middleware de Tyk. Muestra dónde se va el tiempo **dentro** del gateway, a cambio de multiplicar el volumen de spans. Antes estaba fijado en el Bicep y no se podía apagar desde el pipeline | `true` |
+| `SERVICE_VERSION` | `service.version` de la telemetría del gateway. Toma el valor de `TYK_VERSION`, así se sabe qué versión del gateway produjo cada traza | valor de `TYK_VERSION` |
 | `ASSIGN_ACR_PULL_ROLE` | Asignar `AcrPull` desde Bicep | `true` |
-| `ENABLE_SCHEDULED_CLEANUP` | Activa la limpieza horaria programada | desactivada |
-| `POC_MAX_AGE_HOURS` | Edad máxima antes del borrado programado | `2` |
 | `GATEWAY_USE_LOGSTASH` | Envío de logs del gateway al colector por TCP | `true` |
 | `TYK_ENABLE_DETAILED_RECORDING` | Guardar cuerpos completos en Redis. **Riesgo de PII** | `false` |
 | `TYK_LOG_LEVEL` | Nivel de log del gateway y del pump | `info` |
@@ -531,12 +543,11 @@ Desde la pestaña Actions, workflow **deploy**, `Run workflow`:
 
 | Input | Descripción | Valor por defecto |
 |-------|-------------|-------------------|
-| `auto_destroy_minutes` | Minutos hasta el borrado automático del resource group. `0` lo desactiva | `60` |
 | `provision_keys` | Crear las keys de consumidor tras el despliegue | `true` |
 | `observability_enabled` | Desplegar los sidecars de pump y colector | `true` |
 
-El workflow también se dispara con `push` a `main`. **En ese caso no hay auto-limpieza**: hay
-que ejecutar `destroy` a mano o activar `ENABLE_SCHEDULED_CLEANUP`.
+El workflow también se dispara con `push` a `main`. **No hay auto-limpieza en ningún caso**: el
+borrado es siempre manual, ver [10](#10-limpieza-de-recursos).
 
 Secuencia:
 
@@ -559,7 +570,6 @@ Secuencia:
 > Para un despliegue manual, exporta las variables antes de lanzar `az deployment`.
 6. Smoke tests sobre HTTPS (ver sección 7).
 7. Provisión opcional de las keys de consumidor.
-8. Job `auto-destroy`: espera el TTL y borra el resource group.
 
 ### 5.5 Despliegue manual equivalente
 
@@ -606,7 +616,7 @@ estática): la VM factura del orden de 0,05 EUR/h de forma continua, y el disco 
 facturando aunque la VM esté apagada. Un PoC olvidado durante una semana en Container Apps con
 `minReplicas = 0` cuesta prácticamente lo mismo que el ACR; en VM cuesta varios euros.
 
-**Advertencia:** si no ejecutas el workflow `destroy`, el ACR y el workspace de Log Analytics
+**Advertencia:** si no borras el resource group a mano, el ACR y el workspace de Log Analytics
 siguen generando coste indefinidamente, y con `minReplicas = 1` la réplica sigue consumiendo
 vCPU-s más allá de la franquicia mensual.
 
@@ -807,8 +817,17 @@ Además, el colector elimina de forma explícita `Authorization`, `RawRequest`, 
 patrones de tipo `Bearer ...` y `Basic ...`.
 
 Las tres fuentes acaban en New Relic. Las de Azure Monitor (2 y 3) llegan por el servicio
-nativo, que se despliega una sola vez por suscripción y cubre todos sus recursos por reglas de
+nativo, que se aplica una sola vez por suscripción y cubre todos sus recursos por reglas de
 etiquetas.
+
+> **No hay que hacer nada para que exista.** Los pipelines de `poc-microservice-users` y
+> `poc-microservice-orders` invocan el workflow `newrelic-native-integration` en **cada**
+> despliegue, de forma idempotente, así que si has desplegado cualquiera de los dos el monitor ya
+> está. Este repositorio conserva su copia del workflow para poder lanzarlo suelto, pero no la
+> necesita.
+>
+> Si nunca has desplegado un microservicio y despliegas solo el gateway, lánzalo aquí a mano una
+> vez: sin ese recurso, **ningún log de Azure Monitor llega a New Relic**.
 
 #### El compromiso de la etiqueta `newrelicLogs=exclude`
 
@@ -1006,30 +1025,14 @@ Analytics, lo que permite saltar de un sistema a otro sin integración adicional
 
 ## 10. Limpieza de recursos
 
-### Borrado manual
+> **No hay borrado automático ni workflow de borrado.** Se eliminaron el workflow `destroy` y
+> el job `auto-destroy` del pipeline porque fallaban. **La limpieza es manual**, así que el PoC
+> sigue facturando hasta que lo borres tú.
 
-Actions > workflow **destroy** > `Run workflow`:
+### Borrado desde la CLI, la única vía
 
-| Input | Descripción |
-|-------|-------------|
-| `confirm` | Hay que escribir exactamente `DESTROY` |
-| `resource_group` | Opcional. Vacío significa el valor de `AZURE_RESOURCE_GROUP` |
-
-El workflow borra primero el Diagnostic Setting de la suscripción (vive **fuera** del resource
-group y sobreviviría al borrado) y después el resource group completo.
-
-### Borrado automático
-
-- **Job `auto-destroy` de `deploy.yml`**: espera `auto_destroy_minutes` (60 por defecto) y
-  borra el resource group. Solo se activa en ejecuciones manuales del workflow. Si cancelas la
-  ejecución, cancelas también la limpieza.
-- **Limpieza programada de `destroy.yml`**: cada hora, si la variable
-  `ENABLE_SCHEDULED_CLEANUP` vale `true`, borra todo resource group con
-  `tags.project = poc-tyk-api-gateway` y `tags.environment = poc` cuyo tag `createdAt` sea más
-  antiguo que `POC_MAX_AGE_HOURS` (2 por defecto). Es la red de seguridad frente a despliegues
-  olvidados.
-
-### Borrado desde la CLI
+Ojo al orden: el Diagnostic Setting de la suscripción vive **fuera** del resource group y
+sobreviviría a su borrado, así que se elimina primero.
 
 ```bash
 az monitor diagnostic-settings subscription delete --name diag-activitylog-tykpoc --yes

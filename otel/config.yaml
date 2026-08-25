@@ -126,6 +126,11 @@ processors:
       - key: cloud.provider
         value: azure
         action: insert
+      # Version de Tyk, para saber que gateway produjo la telemetria. Los dos
+      # microservicios ya reportan service.version y el gateway no lo hacia.
+      - key: service.version
+        value: "${env:SERVICE_VERSION}"
+        action: upsert
 
   filter/drop_health_traces:
     error_mode: ignore

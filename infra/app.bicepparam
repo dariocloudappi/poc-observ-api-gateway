@@ -47,6 +47,10 @@ param upstreamOrdersUser = readEnvironmentVariable('UPSTREAM_ORDERS_BASIC_USER',
 param upstreamOrdersPassword = readEnvironmentVariable('UPSTREAM_ORDERS_BASIC_PASSWORD', '')
 
 param environmentName = readEnvironmentVariable('ENVIRONMENT', 'poc')
+param serviceVersion = readEnvironmentVariable('SERVICE_VERSION', 'unknown')
+// Un span por middleware de Tyk. Utilisimo para ver donde se va el tiempo
+// dentro del gateway, pero multiplica el volumen de spans.
+param tykDetailedTracing = readEnvironmentVariable('TYK_DETAILED_TRACING', 'true')
 param serviceNamespace = readEnvironmentVariable('SERVICE_NAMESPACE', 'poc-observability')
 param applyLogExclusionTag = bool(readEnvironmentVariable('NR_EXCLUDE_PLATFORM_LOGS', 'false'))
 param observabilityEnabled = bool(readEnvironmentVariable('OBSERVABILITY_ENABLED', 'true'))

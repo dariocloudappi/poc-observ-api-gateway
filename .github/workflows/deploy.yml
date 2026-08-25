@@ -18,10 +18,6 @@ on:
       - 'docs/**'
   workflow_dispatch:
     inputs:
-      auto_destroy_minutes:
-        description: 'Minutes before the resource group is deleted automatically. 0 disables the automatic cleanup'
-        required: false
-        default: '60'
       provision_keys:
         description: 'Create the consumer keys in the gateway after the deployment'
         required: false
@@ -58,10 +54,35 @@ env:
   TYK_VERSION: ${{ vars.TYK_VERSION || 'v5.12.0' }}
   TYK_PUMP_VERSION: ${{ vars.TYK_PUMP_VERSION || 'v1.12.0' }}
   OTEL_VERSION: ${{ vars.OTEL_VERSION || '0.100.0' }}
+  # Un span por middleware de Tyk. Muy util para ver por donde se va el
+  # tiempo dentro del gateway, pero multiplica el volumen de spans. Estaba
+  # fijado a true en el Bicep y no se podia apagar sin editarlo.
+  TYK_DETAILED_TRACING: ${{ vars.TYK_DETAILED_TRACING || 'true' }}
+  # Version reportada como service.version en la telemetria del gateway.
+  SERVICE_VERSION: ${{ vars.TYK_VERSION || 'v5.12.0' }}
   UPSTREAM_USERS_TARGET_URL: ${{ vars.UPSTREAM_USERS_TARGET_URL }}
   UPSTREAM_ORDERS_TARGET_URL: ${{ vars.UPSTREAM_ORDERS_TARGET_URL }}
 
 jobs:
+
+  # ---------------------------------------------------------------------------
+  # La integracion nativa de New Relic, garantizada en cada despliegue
+  # ---------------------------------------------------------------------------
+  # Mismo job que en los dos repositorios de microservicios, y por el mismo
+  # motivo: sin el recurso monitor NINGUN log de Azure Monitor llega a New Relic.
+  # Aqui importa para los eventos del ACR y los del Container Apps Environment.
+  #
+  # Es idempotente y no toca el monitor si ya existe, asi que tenerlo en los tres
+  # repositorios no duplica nada: el primero que despliegue lo crea. Sin el, un
+  # PoC desplegado SOLO desde el gateway se quedaba sin logs de plataforma.
+  #
+  # Si faltan los secrets de New Relic, avisa y no hace nada en lugar de fallar.
+  newrelic-monitor:
+    name: Ensure the New Relic native integration
+    uses: ./.github/workflows/newrelic-native-integration.yml
+    secrets: inherit
+    with:
+      skip_if_unconfigured: 'true'
 
   deploy:
     name: Build and deploy
@@ -322,37 +343,3 @@ jobs:
             echo
             echo "Remember to run the destroy workflow when the PoC is over."
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # -------------------------------------------------------------------------
-  # Automatic cleanup. Keeps the PoC from generating residual cost if somebody
-  # forgets to run destroy.yml. Cancelling this run cancels the cleanup.
-  # -------------------------------------------------------------------------
-  auto-destroy:
-    name: Automatic cleanup
-    needs: deploy
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_destroy_minutes != '0' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-
-      - name: Wait for the configured TTL
-        env:
-          MINUTES: ${{ inputs.auto_destroy_minutes }}
-        run: |
-          set -euo pipefail
-          echo "Waiting ${MINUTES} minute(s) before deleting ${AZURE_RESOURCE_GROUP}."
-          sleep "$(( MINUTES * 60 ))"
-
-      - name: Azure login with OIDC
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Delete the resource group
-        run: |
-          set -euo pipefail
-          echo "Deleting resource group ${AZURE_RESOURCE_GROUP}"
-          az group delete --name "$AZURE_RESOURCE_GROUP" --yes
-          echo "Resource group deleted."

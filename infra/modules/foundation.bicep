@@ -93,6 +93,11 @@ resource acrDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previe
   scope: acr
   properties: {
     workspaceId: logAnalytics.id
+    // Tablas dedicadas: ContainerRegistryLoginEvents y
+    // ContainerRegistryRepositoryEvents. Sin esto todo cae en la tabla generica
+    // AzureDiagnostics y esas dos salen vacias, con lo que el rastro de la
+    // cadena de suministro de imagenes deja de ser consultable como se documenta.
+    logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
         // ContainerRegistryLoginEvents and ContainerRegistryRepositoryEvents.
@@ -162,6 +167,11 @@ resource environmentDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-0
   scope: managedEnvironment
   properties: {
     workspaceId: logAnalytics.id
+    // Tablas dedicadas: ContainerAppConsoleLogs y ContainerAppSystemLogs.
+    // Ojo: el camino appLogsConfiguration del entorno escribe aparte en
+    // ContainerAppConsoleLogs_CL, con sufijo _CL. Son dos rutas distintas hacia
+    // el mismo workspace y cada una tiene su tabla.
+    logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
         categoryGroup: 'allLogs'

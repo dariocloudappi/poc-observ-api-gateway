@@ -92,6 +92,9 @@ param upstreamOrdersPassword string
 
 param newRelicOtlpEndpoint string = 'https://otlp.eu01.nr-data.net:4318'
 param environmentName string = 'poc'
+
+@description('Version reported as service.version in the gateway telemetry. Normally the Tyk version, so the telemetry says which gateway produced it')
+param serviceVersion string = 'unknown'
 param serviceNamespace string = 'poc-observability'
 
 param upstreamUsersTargetUrl string
@@ -201,6 +204,13 @@ var observabilityContainers = [
       {
         name: 'TYK_PUMP_METRICS_ENDPOINT'
         value: 'localhost:9090'
+      }
+      {
+        // service.version de la telemetria del gateway. Se usa la version de
+        // Tyk: asi la telemetria dice que gateway la produjo, que es mas util
+        // que un numero de version inventado.
+        name: 'SERVICE_VERSION'
+        value: serviceVersion
       }
       {
         name: 'OTEL_TELEMETRY_LOG_LEVEL'

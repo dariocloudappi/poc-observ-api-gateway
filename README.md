@@ -323,9 +323,15 @@ Copia `.env.example` a `.env` y sustituye todos los `CHANGE_ME`. **`.env` está 
 Se inyectan en las definiciones de API en el arranque del contenedor. **Nunca tocan un
 fichero versionado.**
 
+> **Ojo con dónde se crean.** Las dos `*_TARGET_URL` son **variables** y las cuatro
+> `*_BASIC_*` son **secrets**. El workflow lee las primeras con `vars.*` y las segundas con
+> `secrets.*`, así que una url creada en la pestaña *Secrets* se ve **vacía** desde `vars.*` y el
+> pipeline falla con *"repository variables ... must be set"* sin más explicación. Son urls, no
+> credenciales: su sitio es *Variables*.
+
 | Variable | Descripción | Debe coincidir con |
 |----------|-------------|--------------------|
-| `UPSTREAM_USERS_TARGET_URL` | URL del microservicio de usuarios, sin barra final | La Web App de `poc-microservice-users` |
+| `UPSTREAM_USERS_TARGET_URL` | URL del microservicio de usuarios, sin barra final. **Opcional**: si se deja vacía se descubre por etiqueta | La Web App de `poc-microservice-users` |
 | `UPSTREAM_USERS_BASIC_USER` | **Secreto.** Usuario Basic Auth del upstream de usuarios | `BASIC_AUTH_USER` en `poc-microservice-users` |
 | `UPSTREAM_USERS_BASIC_PASSWORD` | **Secreto.** Contraseña del upstream de usuarios | `BASIC_AUTH_PASSWORD` en `poc-microservice-users` |
 | `UPSTREAM_ORDERS_TARGET_URL` | URL del microservicio de pedidos, sin barra final | La Web App de `poc-microservice-orders` |
@@ -463,36 +469,67 @@ sustituir el sidecar por Azure Cache for Redis y poner `minReplicas = 0`.
 **1. Aplicación de Entra ID con credenciales federadas (OIDC).** No se usa ningún client
 secret.
 
+El `subject` de la credencial **no lo eliges tú**: es el claim `sub` que GitHub mete en el token,
+y Azure lo compara carácter a carácter, respetando mayúsculas y minúsculas. Si no coincide, el
+login falla con `AADSTS70021: No matching federated identity record found`.
+
+Por eso el repositorio **no se escribe a mano, se deriva**:
+
 ```bash
-# Crear la aplicación y el service principal
+az login
+
+# El "owner/repo" exacto que GitHub tiene registrado. NO lo escribas a mano.
+GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+# Sin la CLI de GitHub, sacalo del remoto de git:
+#   GH_REPO=$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')
+echo "GH_REPO = $GH_REPO"
+
+subId=$(az account show --query id -o tsv)
+tenantId=$(az account show --query tenantId -o tsv)
+
+# Crear la aplicacion y el service principal
 appId=$(az ad app create --display-name "gh-poc-tyk-api-gateway" --query appId -o tsv)
 az ad sp create --id "$appId"
+spId=$(az ad sp show --id "$appId" --query id -o tsv)
 
-# Credencial federada para la rama main
-az ad app federated-credential create --id "$appId" --parameters '{
-  "name": "gh-main",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:<ORG>/<REPO>:ref:refs/heads/main",
-  "audiences": ["api://AzureADTokenExchange"]
-}'
+echo "AZURE_CLIENT_ID       = $appId"
+echo "AZURE_TENANT_ID       = $tenantId"
+echo "AZURE_SUBSCRIPTION_ID = $subId"
 
-# Credencial federada para ejecuciones manuales del workflow
-az ad app federated-credential create --id "$appId" --parameters '{
-  "name": "gh-dispatch",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:<ORG>/<REPO>:ref:refs/heads/main",
-  "audiences": ["api://AzureADTokenExchange"]
-}'
+# Credencial federada para la rama main. Cubre el push y el workflow_dispatch
+# sobre main: los dos disparadores producen el mismo claim sub.
+az ad app federated-credential create --id "$appId" --parameters "{
+  \"name\": \"gh-main\",
+  \"issuer\": \"https://token.actions.githubusercontent.com\",
+  \"subject\": \"repo:${GH_REPO}:ref:refs/heads/main\",
+  \"audiences\": [\"api://AzureADTokenExchange\"]
+}"
+
+# Comprueba que ha quedado registrada tal cual
+az ad app federated-credential list --id "$appId" \
+  --query "[].{name:name,subject:subject}" -o table
 
 # Permisos: Contributor para crear los recursos y RBAC Administrator para
 # asignar AcrPull a la identidad gestionada.
-subId=$(az account show --query id -o tsv)
-spId=$(az ad sp show --id "$appId" --query id -o tsv)
 az role assignment create --assignee-object-id "$spId" --assignee-principal-type ServicePrincipal \
   --role "Contributor" --scope "/subscriptions/$subId"
 az role assignment create --assignee-object-id "$spId" --assignee-principal-type ServicePrincipal \
   --role "Role Based Access Control Administrator" --scope "/subscriptions/$subId"
 ```
+
+> **No hace falta adivinar el `sub`.** El workflow `deploy` lo imprime en el paso *Show the OIDC
+> subject expected by Azure* y lo deja en el resumen del run, antes de intentar el login. Si el
+> login falla, copia ese valor literal al campo `subject`. Ese paso funciona aunque no haya nada
+> configurado en Azure todavía, así que puedes lanzar el workflow una vez solo para leerlo.
+
+> Antes había aquí dos credenciales federadas, `gh-main` y `gh-dispatch`, con **el mismo**
+> subject. Sobra una: `push` y `workflow_dispatch` sobre `main` generan el mismo claim `sub`
+> (`repo:OWNER/REPO:ref:refs/heads/main`), así que una sola cubre los dos disparadores.
+
+Si renombras el repositorio o la organización, el `sub` cambia y el login deja de funcionar hasta
+que recrees la credencial. Se puede evitar cambiando la plantilla del claim para que use el id
+numérico del repositorio, que es inmutable: ver el README de `poc-microservice-users`,
+sección 8.4.
 
 Si no es posible conceder el rol de administración de RBAC, pon la variable de repositorio
 `ASSIGN_ACR_PULL_ROLE=false` y asigna `AcrPull` a la identidad `id-tykpoc` manualmente.
@@ -1120,10 +1157,9 @@ despliegue**, dado que su vida útil prevista es de una hora.
 
 ## 12. Automatizar el descubrimiento de los upstreams
 
-Hoy `UPSTREAM_USERS_TARGET_URL` y `UPSTREAM_ORDERS_TARGET_URL` son variables de repositorio que
-se pegan a mano después de desplegar cada microservicio. Es el único paso manual que queda en el
-PoC completo, y **no hace falta ningún componente nuevo para quitarlo**: ARM ya funciona como
-registro de servicios.
+**Implementado.** El paso `Resolve the upstream urls` del pipeline resuelve las dos urls
+preguntando a Azure, y las variables de repositorio quedan como override manual opcional. No hace
+falta ningún componente nuevo: ARM ya funciona como registro de servicios.
 
 Cada microservicio etiqueta su Web App con `project=poc-microservice-users` o
 `poc-microservice-orders` y `environment=poc`, y la identidad federada de este repositorio ya
@@ -1139,7 +1175,7 @@ El diseño propuesto, en tres piezas independientes:
 
 | Pieza | Qué resuelve |
 |-------|--------------|
-| **Paso de descubrimiento** en `deploy.yml`, antes del despliegue: resuelve las dos URLs por etiqueta y falla con un mensaje claro si algún microservicio no está desplegado. Las variables manuales pasan a ser un *override* opcional | Quita el paso de copiar y pegar, y convierte "olvidé actualizar la URL" en un fallo temprano y explícito |
+| ~~**Paso de descubrimiento**~~ **HECHO**: `Resolve the upstream urls` resuelve las dos urls por etiqueta y falla con un mensaje claro si algún microservicio no está desplegado. Las variables quedan como *override* opcional | Quita el paso de copiar y pegar, y convierte "olvidé actualizar la URL" en un fallo temprano y explícito |
 | **`repository_dispatch`** al final de los pipelines de users y orders, apuntando a este repositorio | El gateway se reconfigura solo cuando un microservicio se redespliega y cambia de URL |
 | **Key Vault compartido** en `rg-newrelic-shared`, leído con las identidades administradas que los tres servicios ya tienen | Elimina los seis secretos duplicados entre repositorios y el riesgo de rotar en un sitio y no en el otro |
 

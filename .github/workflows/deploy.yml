@@ -120,10 +120,21 @@ jobs:
 
       - name: Validate non secret configuration
         run: |
-          if [ -z "$UPSTREAM_USERS_TARGET_URL" ] || [ -z "$UPSTREAM_ORDERS_TARGET_URL" ]; then
-            echo "ERROR: repository variables UPSTREAM_USERS_TARGET_URL and UPSTREAM_ORDERS_TARGET_URL must be set" >&2
-            exit 1
-          fi
+          # Ojo: estas dos se leen con vars.*, no con secrets.*, asi que tienen
+          # que estar en la pestana Variables. Creadas como secret, vars.* las ve
+          # vacias y este paso fallaba sin explicar por que.
+          #
+          # Ya no es obligatorio rellenarlas: si estan vacias, el paso
+          # "Resolve the upstream urls" las descubre por etiqueta.
+          for v in UPSTREAM_USERS_TARGET_URL UPSTREAM_ORDERS_TARGET_URL; do
+            if [ -z "${!v}" ]; then
+              echo "${v} is not set as a repository VARIABLE. It will be discovered from Azure."
+            else
+              case "${!v}" in
+                */) echo "ERROR: ${v} must not end with a slash" >&2; exit 1 ;;
+              esac
+            fi
+          done
 
       - name: Azure login with OIDC
         uses: azure/login@v2
@@ -134,6 +145,50 @@ jobs:
 
       - name: Install Bicep CLI
         run: az bicep install
+
+      # ---------------------------------------------------------------------
+      # Descubrimiento de los upstreams
+      # ---------------------------------------------------------------------
+      # Las urls de los microservicios NO se pegan a mano. Se resuelven
+      # preguntando a Azure por las Web Apps etiquetadas con su project, que es
+      # el mismo mecanismo que usa orders para descubrir este gateway.
+      #
+      # Las variables de repositorio siguen funcionando como override manual: si
+      # tienen valor, ganan y no se descubre nada.
+      - name: Resolve the upstream urls
+        run: |
+          set -euo pipefail
+
+          discover() {
+            az webapp list               --query "[?tags.project=='$1' && tags.environment=='poc'].defaultHostName | [0]"               -o tsv 2>/dev/null || true
+          }
+
+          missing=""
+          for pair in "UPSTREAM_USERS_TARGET_URL:poc-microservice-users"                       "UPSTREAM_ORDERS_TARGET_URL:poc-microservice-orders"; do
+            var="${pair%%:*}"
+            project="${pair##*:}"
+
+            if [ -n "${!var}" ]; then
+              echo "${var} is set explicitly: ${!var}. Skipping discovery."
+              continue
+            fi
+
+            host=$(discover "$project")
+            if [ -z "$host" ] || [ "$host" = "None" ]; then
+              missing="${missing} ${project}"
+              continue
+            fi
+            echo "${var} discovered: https://${host}"
+            echo "${var}=https://${host}" >> "$GITHUB_ENV"
+          done
+
+          if [ -n "$missing" ]; then
+            echo "ERROR: no web app tagged environment=poc was found for:${missing}" >&2
+            echo "The gateway cannot route to an upstream that does not exist." >&2
+            echo "Deploy those microservices first, or set the corresponding" >&2
+            echo "UPSTREAM_*_TARGET_URL repository VARIABLE by hand." >&2
+            exit 1
+          fi
 
       # ---------------------------------------------------------------------
       # Stage 1: resource group, Log Analytics, registry, identity, environment

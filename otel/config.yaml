@@ -31,7 +31,6 @@ connectors:
       # http.route only if the APIs do not use dynamic path params.
       - name: http.route
       - name: tyk.api.name
-      - name: http.target
     # Prefix of the generated metric names: tyk.gateway.calls and
     # tyk.gateway.duration. Dots because that is the OTel convention for metric
     # names, while the service.name of the gateway is tyk-gateway. Same words in
@@ -270,6 +269,21 @@ processors:
           - delete_key(attributes, "RawResponse") where attributes["RawResponse"] != nil
           - delete_key(attributes, "origin") where attributes["origin"] != nil
           - delete_key(attributes, "Authorization") where attributes["Authorization"] != nil
+
+          # ------------------------------------------------------------
+          # El procesador "redaction" NO soporta logs en el colector
+          # v0.100.0: declararlo en el pipeline de logs aborta el arranque
+          # con "telemetry type is not supported". Sus blocked_values se
+          # replican aqui con OTTL, que si funciona sobre logs.
+          # Sin backreferencias ($1) a proposito: el colector expande "$"
+          # como variable de entorno.
+          # ------------------------------------------------------------
+
+          - replace_pattern(body, "(?i)(bearer|basic) +[A-Za-z0-9+/=._-]+", "REDACTED")
+            where IsString(body)
+
+          - replace_pattern(body, "[a-f0-9]{64}", "REDACTED")
+            where IsString(body)
     trace_statements:
       - context: span
         statements:
@@ -417,7 +431,6 @@ service:
         - transform/parse_tyk
         - filter/drop_noisy_logs
         - transform/remove_sensitive
-        - redaction
         - resource
         - resource/logs
         - batch/logs

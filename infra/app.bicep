@@ -376,9 +376,15 @@ var baseContainers = [
         name: 'TYK_GW_OPENTELEMETRY_CONTEXTPROPAGATION'
         value: 'tracecontext'
       }
+      // Segundos que el gateway espera al colector OTLP. Con el valor por
+      // defecto (10) un colector caido se traduce en 10 s de espera POR
+      // PETICION, incluido /hello: la telemetria pasa a degradar la latencia
+      // de la API. Con 2 s el fallo se nota en la telemetria, no en el
+      // cliente. Sintoma en los logs del gateway cuando ocurre:
+      //   "traces export: context deadline exceeded: ... connection refused"
       {
         name: 'TYK_GW_OPENTELEMETRY_CONNECTIONTIMEOUT'
-        value: '10'
+        value: '2'
       }
     ]
   }

@@ -38,19 +38,14 @@ param tykNodeSecret = readEnvironmentVariable('TYK_NODE_SECRET', '')
 param newRelicLicenseKey = readEnvironmentVariable('NR_LICENSE_KEY', '')
 param newRelicOtlpEndpoint = readEnvironmentVariable('NR_OTLP_ENDPOINT', 'https://otlp.eu01.nr-data.net:4318')
 
-param upstreamUsersTargetUrl = readEnvironmentVariable('UPSTREAM_USERS_TARGET_URL', '')
-param upstreamUsersUser = readEnvironmentVariable('UPSTREAM_USERS_BASIC_USER', '')
-param upstreamUsersPassword = readEnvironmentVariable('UPSTREAM_USERS_BASIC_PASSWORD', '')
-
-param upstreamOrdersTargetUrl = readEnvironmentVariable('UPSTREAM_ORDERS_TARGET_URL', '')
-param upstreamOrdersUser = readEnvironmentVariable('UPSTREAM_ORDERS_BASIC_USER', '')
-param upstreamOrdersPassword = readEnvironmentVariable('UPSTREAM_ORDERS_BASIC_PASSWORD', '')
+// Definiciones de API ya renderizadas por scripts/render-apis.sh en el pipeline,
+// en base64. Los upstreams y sus credenciales no llegan aqui: viajan dentro de
+// estas definiciones, que se montan como secreto en el contenedor.
+param usersApiDefinitionBase64 = readEnvironmentVariable('API_DEFINITION_USERS_B64', '')
+param ordersApiDefinitionBase64 = readEnvironmentVariable('API_DEFINITION_ORDERS_B64', '')
 
 param environmentName = readEnvironmentVariable('ENVIRONMENT', 'poc')
 param serviceVersion = readEnvironmentVariable('SERVICE_VERSION', 'unknown')
-// Un span por middleware de Tyk. Utilisimo para ver donde se va el tiempo
-// dentro del gateway, pero multiplica el volumen de spans.
-param tykDetailedTracing = readEnvironmentVariable('TYK_DETAILED_TRACING', 'true')
 param serviceNamespace = readEnvironmentVariable('SERVICE_NAMESPACE', 'poc-observability')
 param applyLogExclusionTag = bool(readEnvironmentVariable('NR_EXCLUDE_PLATFORM_LOGS', 'false'))
 param observabilityEnabled = bool(readEnvironmentVariable('OBSERVABILITY_ENABLED', 'true'))

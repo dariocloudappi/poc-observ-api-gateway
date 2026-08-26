@@ -31,3 +31,6 @@ tyk/apps/*.json
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# Definiciones de API renderizadas: contienen credenciales
+tyk/apps-rendered/

@@ -101,10 +101,9 @@ jobs:
           TYK_SECRET: ${{ secrets.TYK_SECRET }}
           TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
-          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
-          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
-          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
-          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
+          # Las credenciales de upstream NO se pasan aqui: ya estan dentro de las
+          # definiciones de API renderizadas, que llegan en API_DEFINITION_*_B64
+          # desde el paso anterior a traves de GITHUB_ENV.
         run: |
           for name in TYK_SECRET TYK_NODE_SECRET NR_LICENSE_KEY \
                       UPSTREAM_USERS_BASIC_USER UPSTREAM_USERS_BASIC_PASSWORD \
@@ -249,6 +248,42 @@ jobs:
           echo "otel=${ACR}/otel-collector:${TAG}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
+      # Definiciones de API
+      # ---------------------------------------------------------------------
+      # Se renderizan AQUI y no dentro del contenedor: la imagen de Tyk es
+      # distroless desde la v5.3 y no tiene shell, asi que un entrypoint de sh
+      # no puede arrancar. Tampoco se hornean en la imagen, porque llevan la
+      # cabecera Authorization: Basic de cada upstream.
+      #
+      # El resultado viaja en base64 para que el JSON llegue intacto, y termina
+      # como secreto del Container App montado en /opt/tyk-gateway/apps.
+      - name: Render the Tyk API definitions
+        id: apis
+        env:
+          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
+          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
+          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
+          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
+          TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
+        run: |
+          set -euo pipefail
+          ./scripts/render-apis.sh tyk/apps-rendered
+
+          # base64 en una sola linea, para pasarlo por variable de entorno.
+          users_b64=$(base64 -w0 tyk/apps-rendered/microservice-users.json)
+          orders_b64=$(base64 -w0 tyk/apps-rendered/microservice-orders.json)
+
+          # Contienen credenciales: enmascarar antes de que puedan aparecer.
+          echo "::add-mask::${users_b64}"
+          echo "::add-mask::${orders_b64}"
+
+          echo "API_DEFINITION_USERS_B64=${users_b64}" >> "$GITHUB_ENV"
+          echo "API_DEFINITION_ORDERS_B64=${orders_b64}" >> "$GITHUB_ENV"
+
+          echo "Rendered definitions:"
+          ls -l tyk/apps-rendered/
+
+      # ---------------------------------------------------------------------
       # Stage 3: workload
       # ---------------------------------------------------------------------
       # Secrets are exported as environment variables and read by the
@@ -281,7 +316,7 @@ jobs:
           # message instead.
           for name in AZURE_CAE_NAME AZURE_IDENTITY_ID AZURE_ACR_LOGIN_SERVER \
                       IMAGE_GATEWAY IMAGE_PUMP IMAGE_OTEL \
-                      UPSTREAM_USERS_TARGET_URL UPSTREAM_ORDERS_TARGET_URL; do
+                      API_DEFINITION_USERS_B64 API_DEFINITION_ORDERS_B64; do
             if [ -z "${!name:-}" ]; then
               echo "ERROR: ${name} is empty. The foundation stage did not return it." >&2
               exit 1

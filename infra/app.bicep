@@ -78,13 +78,23 @@ param tykNodeSecret string
 @secure()
 param newRelicLicenseKey string
 
-@description('Basic Auth password used by the gateway against the users upstream')
+// Definiciones de API de Tyk ya renderizadas, en base64.
+//
+// Las renderiza el pipeline con scripts/render-apis.sh y llegan aqui como
+// secretos, porque contienen la cabecera Authorization: Basic de cada upstream.
+// No se renderizan dentro del contenedor: la imagen de Tyk es distroless y no
+// tiene shell. Y no se hornean en la imagen: eso metería credenciales en una
+// capa. Se montan como fichero en /opt/tyk-gateway/apps.
+//
+// Van en base64 para que el JSON, con sus comillas y saltos de linea, viaje
+// intacto por variables de entorno hasta el .bicepparam.
+@description('Rendered users API definition, base64 encoded')
 @secure()
-param upstreamUsersPassword string
+param usersApiDefinitionBase64 string
 
-@description('Basic Auth password used by the gateway against the orders upstream')
+@description('Rendered orders API definition, base64 encoded')
 @secure()
-param upstreamOrdersPassword string
+param ordersApiDefinitionBase64 string
 
 // -----------------------------------------------------------------------------
 // Non secret configuration
@@ -97,14 +107,11 @@ param environmentName string = 'poc'
 param serviceVersion string = 'unknown'
 param serviceNamespace string = 'poc-observability'
 
-param upstreamUsersTargetUrl string
-param upstreamUsersUser string
-param upstreamOrdersTargetUrl string
-param upstreamOrdersUser string
-
-param tykOrgId string = 'poc-organization'
+// Los upstreams (url, usuario, contrasena) y tykOrgId / tykDetailedTracing YA NO
+// son parametros de la plantilla: los consume scripts/render-apis.sh en el
+// pipeline, que produce las definiciones de API ya resueltas. La plantilla solo
+// recibe el resultado, como secreto.
 param tykLogLevel string = 'info'
-param tykDetailedTracing string = 'true'
 param tykEnableDetailedRecording string = 'false'
 param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr'
 param otelTelemetryLogLevel string = 'info'
@@ -230,6 +237,14 @@ var baseContainers = [
       cpu: json('0.5')
       memory: '1Gi'
     }
+    // Tyk carga de aqui las definiciones de API. El directorio existe en la
+    // imagen y el montaje lo sustituye por los ficheros del secreto.
+    volumeMounts: [
+      {
+        volumeName: 'api-definitions'
+        mountPath: '/opt/tyk-gateway/apps'
+      }
+    ]
     probes: [
       {
         type: 'Startup'
@@ -293,38 +308,9 @@ var baseContainers = [
         value: '6379'
       }
       // API definitions rendered by the entrypoint
-      {
-        name: 'TYK_ORG_ID'
-        value: tykOrgId
-      }
-      {
-        name: 'TYK_DETAILED_TRACING'
-        value: observabilityEnabled ? tykDetailedTracing : 'false'
-      }
-      {
-        name: 'UPSTREAM_USERS_TARGET_URL'
-        value: upstreamUsersTargetUrl
-      }
-      {
-        name: 'UPSTREAM_USERS_BASIC_USER'
-        value: upstreamUsersUser
-      }
-      {
-        name: 'UPSTREAM_USERS_BASIC_PASSWORD'
-        secretRef: 'upstream-users-password'
-      }
-      {
-        name: 'UPSTREAM_ORDERS_TARGET_URL'
-        value: upstreamOrdersTargetUrl
-      }
-      {
-        name: 'UPSTREAM_ORDERS_BASIC_USER'
-        value: upstreamOrdersUser
-      }
-      {
-        name: 'UPSTREAM_ORDERS_BASIC_PASSWORD'
-        secretRef: 'upstream-orders-password'
-      }
+      // Las credenciales de upstream YA NO llegan al contenedor: viajan dentro
+      // de las definiciones de API renderizadas, montadas como secreto. Una
+      // credencial menos en el entorno del proceso.
       // Analytics consumed by Tyk Pump
       {
         name: 'TYK_GW_ENABLEANALYTICS'
@@ -473,17 +459,36 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           value: newRelicLicenseKey
         }
         {
-          name: 'upstream-users-password'
-          value: upstreamUsersPassword
+          name: 'api-definition-users'
+          value: base64ToString(usersApiDefinitionBase64)
         }
         {
-          name: 'upstream-orders-password'
-          value: upstreamOrdersPassword
+          name: 'api-definition-orders'
+          value: base64ToString(ordersApiDefinitionBase64)
         }
       ]
     }
     template: {
       containers: observabilityEnabled ? concat(baseContainers, observabilityContainers) : baseContainers
+      // Las definiciones de API entran como ficheros. El "path" de cada secreto
+      // es lo que permite que se llamen *.json, que es lo que Tyk busca: un
+      // nombre de secreto no admite puntos.
+      volumes: [
+        {
+          name: 'api-definitions'
+          storageType: 'Secret'
+          secrets: [
+            {
+              secretRef: 'api-definition-users'
+              path: 'microservice-users.json'
+            }
+            {
+              secretRef: 'api-definition-orders'
+              path: 'microservice-orders.json'
+            }
+          ]
+        }
+      ]
       scale: {
         minReplicas: minReplicas
         maxReplicas: maxReplicas

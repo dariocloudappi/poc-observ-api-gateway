@@ -124,6 +124,11 @@ services:
         # Same spelling as service.name everywhere else: tyk-gateway.
         tag: "tyk-gateway"
     volumes:
+      # Definiciones de API renderizadas en el HOST por scripts/render-apis.sh.
+      # No se renderizan dentro del contenedor porque la imagen de Tyk es
+      # distroless y no tiene shell. Ejecuta antes:
+      #   set -a && . ./.env && set +a && ./scripts/render-apis.sh
+      - ./tyk/apps-rendered:/opt/tyk-gateway/apps:ro
       - ./tyk/certs:/opt/tyk-gateway/certs:ro
       - ./tyk/middleware:/opt/tyk-gateway/middleware:ro
     depends_on:

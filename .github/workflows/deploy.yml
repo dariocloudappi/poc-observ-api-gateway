@@ -304,7 +304,6 @@ jobs:
           IMAGE_PUMP: ${{ steps.images.outputs.pump }}
           IMAGE_OTEL: ${{ steps.images.outputs.otel }}
           OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
-          GATEWAY_USE_LOGSTASH: ${{ vars.GATEWAY_USE_LOGSTASH || 'true' }}
           TYK_ENABLE_DETAILED_RECORDING: ${{ vars.TYK_ENABLE_DETAILED_RECORDING || 'false' }}
           TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'info' }}
           TYK_SECRET: ${{ secrets.TYK_SECRET }}

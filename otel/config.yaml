@@ -10,12 +10,22 @@
 #   TYK_PUMP_METRICS_ENDPOINT host:port of the Tyk Pump prometheus pump
 #   OTEL_TELEMETRY_LOG_LEVEL  collector self-telemetry log level
 #
-# Log intake works in two modes, both always listening:
-#   - fluentforward (24224): used by docker compose locally through the
-#     fluentd logging driver.
-#   - tcplog (5170): used in Azure Container Apps, fed by the Tyk gateway
-#     logstash transport, because the container runtime is not under our
-#     control there.
+# Entrada de logs: SOLO fluentforward (24224), alimentado en local por el
+# driver de logging fluentd de docker compose.
+#
+# En Azure este colector NO procesa logs. El transporte logstash de Tyk se
+# retiro porque su hook abre la conexion al inicializarse y no reintenta
+# nunca: en Container Apps los contenedores de una replica arrancan en
+# paralelo, el gateway suele ganar la carrera al colector y entonces no
+# envia ni una linea. Se probaron TCP y UDP y los dos dieron 0 logs.
+# Alli los logs de los cuatro contenedores salen por stdout, que la
+# plataforma convierte en diagnostic logs de Azure Monitor. Ver
+# infra/modules/foundation.bicep.
+#
+# Consecuencia a tener presente: los logs que llegan por esa via NO pasan
+# por este fichero, asi que no reciben el mapeo de severity, el
+# service.name, la correlacion con trace.id ni el redactado de abajo. Eso
+# solo aplica al flujo local.
 # =============================================================================
 
 connectors:
@@ -52,13 +62,8 @@ receivers:
   fluentforward:
     endpoint: 0.0.0.0:24224
 
-  # Azure mode: Tyk gateway logstash transport (one JSON document per line).
-  tcplog/tyk:
-    listen_address: 0.0.0.0:5170
-    add_attributes: false
-    attributes:
-      log.source: tyk-logstash
-
+  # Trazas del gateway, en Azure y en local. Este exportador SI reconecta solo
+  # si el colector arranca despues, al contrario que el hook de logstash.
   otlp:
     protocols:
       grpc:
@@ -425,7 +430,7 @@ service:
       exporters: [otlphttp/newrelic]
 
     logs:
-      receivers: [fluentforward, tcplog/tyk]
+      receivers: [fluentforward]
       processors:
         - memory_limiter
         - transform/parse_tyk

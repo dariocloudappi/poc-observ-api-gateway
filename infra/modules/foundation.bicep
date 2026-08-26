@@ -26,15 +26,11 @@ param applyLogExclusionTag bool = false
 // AcrPull built in role definition id (constant across every tenant).
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
-// Trade off, and it is a real one. The gateway ships its own logs to New Relic
-// through the OpenTelemetry Collector, so its platform logs would arrive twice.
-// But in Container Apps the log categories live on the ENVIRONMENT, not per
-// container, so excluding it silences the console output of Redis, the pump and
-// the collector too, and those have no other path to New Relic: the collector
-// only receives what the gateway sends it over the logstash transport.
-//
-// Default is therefore OFF, which favours complete coverage. Turn it on only if
-// you actually observe duplicated gateway lines.
+// Debe quedarse en OFF. Ya no hay riesgo de duplicado que justificase activarlo:
+// el colector no procesa logs en Azure, asi que esta es la UNICA via por la que
+// los cuatro contenedores llegan a New Relic. Activarlo los silencia todos, y
+// ademas las categorias de log viven en el ENTORNO, no por contenedor, asi que
+// no se puede excluir solo uno.
 //
 // The registry deliberately never carries this tag: its login and repository
 // events are the audit trail of the image supply chain, nothing else emits
@@ -120,8 +116,19 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (assi
 // =============================================================================
 // Container Apps environment
 // -----------------------------------------------------------------------------
-// Console and system logs of every container app in the environment are sent
-// to the Log Analytics workspace. This is the Azure Monitor path.
+// destination 'azure-monitor' es lo que convierte el stdout/stderr de TODOS los
+// contenedores del entorno en diagnostic logs de Azure Monitor, categorias
+// ContainerAppConsoleLogs y ContainerAppSystemLogs. Solo desde ahi puede
+// reenviarlos la integracion nativa de New Relic.
+//
+// Con destination 'log-analytics' los logs van DIRECTOS al workspace y nunca
+// pasan por Azure Monitor, asi que no hay nada que reenviar: el diagnostic
+// setting de mas abajo pide 'allLogs' y no recibe nada de consola. Ese era el
+// motivo por el que los logs de redis, pump y colector no llegaban a New Relic.
+//
+// Las categorias de log solo existen a nivel de ENTORNO. A nivel de container
+// app el parametro logs no esta soportado, solo AllMetrics.
+// Ref: https://learn.microsoft.com/azure/container-apps/log-options
 // =============================================================================
 
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
@@ -129,14 +136,13 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   location: location
   tags: environmentTags
   properties: {
-    // With enableLogAnalytics off, New Relic is the only destination and the
-    // console logs stop being copied into the workspace as well.
+    // Sin observabilidad no se guarda nada. Con ella, todo sale por Azure
+    // Monitor y el destino se decide en el diagnostic setting, no aqui.
+    // Efecto secundario deseado: se elimina el listKeys() del workspace, que
+    // devolvia un secreto nuevo en cada compilacion y ensuciaba el diff del
+    // despliegue sin que nada hubiese cambiado de verdad.
     appLogsConfiguration: enableLogAnalytics ? {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: logAnalytics.properties.customerId
-        sharedKey: logAnalytics.listKeys().primarySharedKey
-      }
+      destination: 'azure-monitor'
     } : {
       destination: 'none'
     }

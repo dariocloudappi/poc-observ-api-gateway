@@ -100,11 +100,9 @@ services:
       TYK_GW_ACCESSLOGS_TEMPLATE: ${TYK_GW_ACCESSLOGS_TEMPLATE:-method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr}
       TYK_GW_TRACK404LOGS: ${TYK_GW_TRACK404LOGS:-false}
 
-      # Log shipping. Locally the fluentd docker driver is used, so the
-      # logstash transport stays off. In Azure it is the other way round.
-      TYK_GW_USELOGSTASH: ${TYK_GW_USE_LOGSTASH:-false}
-      TYK_GW_LOGSTASHTRANSPORT: ${TYK_GW_LOGSTASH_TRANSPORT:-tcp}
-      TYK_GW_LOGSTASHNETWORKADDR: ${TYK_GW_LOGSTASH_ADDR:-otel-collector:5170}
+      # El transporte logstash se retiro del proyecto: su hook no reintenta la
+      # conexion, asi que en Azure no entregaba nada. Aqui los logs los recoge
+      # el driver fluentd de mas abajo, que es el que si funciona.
 
       # OpenTelemetry traces
       TYK_GW_OPENTELEMETRY_ENABLED: ${TYK_GW_OTEL_ENABLED:-true}

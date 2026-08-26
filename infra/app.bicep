@@ -119,9 +119,6 @@ param otelTelemetryLogLevel string = 'info'
 @description('Master switch for the observability sidecars. When false the pump and the collector are not deployed and the gateway stops emitting telemetry')
 param observabilityEnabled bool = true
 
-@description('Ship gateway logs to the collector over the logstash TCP transport. Set to false if the gateway fails to start because the collector is not listening yet: logs still reach Log Analytics through stdout')
-param gatewayUseLogstash string = 'true'
-
 @description('Keep at 1 for the PoC: Redis runs as a sidecar, so more replicas would split the key store')
 @minValue(0)
 @maxValue(1)
@@ -341,20 +338,26 @@ var baseContainers = [
         name: 'TYK_GW_TRACK404LOGS'
         value: 'false'
       }
-      // Log shipping towards the collector. The fluentd docker driver is not
-      // available in Container Apps, so the logstash TCP transport is used.
-      {
-        name: 'TYK_GW_USELOGSTASH'
-        value: observabilityEnabled ? gatewayUseLogstash : 'false'
-      }
-      {
-        name: 'TYK_GW_LOGSTASHTRANSPORT'
-        value: 'tcp'
-      }
-      {
-        name: 'TYK_GW_LOGSTASHNETWORKADDR'
-        value: 'localhost:5170'
-      }
+      // El transporte logstash de Tyk queda DESACTIVADO a proposito.
+      //
+      // Motivo, reproducido en local: el hook de logstash abre su conexion al
+      // inicializarse y NO reintenta nunca. En Container Apps los contenedores
+      // de una replica arrancan en paralelo sin garantia de orden, asi que el
+      // gateway suele inicializar antes de que el colector escuche en :5170 y
+      // entonces no envia ni una linea durante toda la vida del contenedor.
+      // Ni TCP ni UDP lo salvan: se probaron los dos y ambos dieron 0 logs
+      // cuando el gateway arranca primero. Y aunque se arreglase el orden,
+      // cualquier reinicio del colector volveria a romperlo de forma
+      // permanente.
+      //
+      // Los logs de los cuatro contenedores salen ahora por el stdout que
+      // recoge la plataforma: appLogsConfiguration en 'azure-monitor' los
+      // convierte en diagnostic logs y de ahi los reenvia New Relic. Ver
+      // foundation.bicep. El colector se queda con trazas y metricas por
+      // OTLP, que si reconectan solas.
+      //
+      // En local no aplica: docker-compose declara depends_on sobre el
+      // colector y ademas usa el driver fluentd, que no existe aqui.
       // Traces
       {
         name: 'TYK_GW_OPENTELEMETRY_ENABLED'

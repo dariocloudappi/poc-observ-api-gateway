@@ -60,6 +60,13 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
       // Hard stop on ingestion so a runaway log loop cannot generate cost.
       dailyQuotaGb: logDailyQuotaGb
     }
+    // S6329: acceso publico de red. Es DELIBERADO y necesario aqui:
+    //  - el pipeline consulta el workspace con "az monitor log-analytics query"
+    //    desde un runner de GitHub, que esta fuera de cualquier VNet;
+    //  - la ingesta llega desde recursos gestionados de Azure.
+    // Cerrarlo exige Private Link mas un runner autohospedado dentro de la VNet,
+    // fuera del alcance de un PoC de una hora. Documentado como limitacion
+    // conocida en el README.
     publicNetworkAccessForIngestion: 'Enabled'
     publicNetworkAccessForQuery: 'Enabled'
   }
@@ -72,15 +79,20 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
 resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
   name: toLower('acr${namePrefix}${uniqueString(resourceGroup().id)}')
   location: location
-  tags: tags
   sku: {
     name: 'Basic'
   }
+  tags: tags
   properties: {
     // The admin user is a shared static credential. Pulls are done with a
     // managed identity instead, so it stays disabled.
     adminUserEnabled: false
     anonymousPullEnabled: false
+    // S6329: acceso publico de red. Es DELIBERADO: las imagenes las construye y
+    // sube un runner de GitHub, que esta fuera de cualquier VNet. Cerrarlo exige
+    // Private Link mas un runner autohospedado. La superficie se limita por otra
+    // via: adminUserEnabled y anonymousPullEnabled estan en false, y los pull
+    // usan una identidad gestionada con rol AcrPull.
     publicNetworkAccess: 'Enabled'
   }
 }

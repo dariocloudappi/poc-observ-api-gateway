@@ -268,7 +268,12 @@ jobs:
           TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
         run: |
           set -euo pipefail
-          ./scripts/render-apis.sh tyk/apps-rendered
+          # Se invoca con bash a proposito, no como ./script: asi no depende del
+          # bit de ejecucion. En Windows core.filemode suele estar en false, el
+          # chmod local no se registra en git y el runner recibe el fichero sin
+          # permisos (exit 126, Permission denied). El modo 100755 esta ademas
+          # registrado en el indice, pero esto lo hace inmune de todas formas.
+          bash scripts/render-apis.sh tyk/apps-rendered
 
           # base64 en una sola linea, para pasarlo por variable de entorno.
           users_b64=$(base64 -w0 tyk/apps-rendered/microservice-users.json)

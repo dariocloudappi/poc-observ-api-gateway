@@ -85,30 +85,6 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
   }
 }
 
-// Audit trail of the image supply chain: who logged in to the registry and who
-// pushed or pulled which repository and tag. Nothing else records it, so this
-// is the only way to answer "where did the running image come from".
-resource acrDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (enableLogAnalytics) {
-  name: 'diag-acr-${namePrefix}'
-  scope: acr
-  properties: {
-    workspaceId: logAnalytics.id
-    logs: [
-      {
-        // ContainerRegistryLoginEvents and ContainerRegistryRepositoryEvents.
-        categoryGroup: 'allLogs'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
-        enabled: true
-      }
-    ]
-  }
-}
-
 // =============================================================================
 // Managed identity used by the container app to pull from the registry
 // =============================================================================

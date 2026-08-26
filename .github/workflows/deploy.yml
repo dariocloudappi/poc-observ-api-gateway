@@ -101,9 +101,10 @@ jobs:
           TYK_SECRET: ${{ secrets.TYK_SECRET }}
           TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
-          # Las credenciales de upstream NO se pasan aqui: ya estan dentro de las
-          # definiciones de API renderizadas, que llegan en API_DEFINITION_*_B64
-          # desde el paso anterior a traves de GITHUB_ENV.
+          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
+          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
+          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
+          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
         run: |
           for name in TYK_SECRET TYK_NODE_SECRET NR_LICENSE_KEY \
                       UPSTREAM_USERS_BASIC_USER UPSTREAM_USERS_BASIC_PASSWORD \
@@ -304,10 +305,9 @@ jobs:
           TYK_SECRET: ${{ secrets.TYK_SECRET }}
           TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}
-          UPSTREAM_USERS_BASIC_USER: ${{ secrets.UPSTREAM_USERS_BASIC_USER }}
-          UPSTREAM_USERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_USERS_BASIC_PASSWORD }}
-          UPSTREAM_ORDERS_BASIC_USER: ${{ secrets.UPSTREAM_ORDERS_BASIC_USER }}
-          UPSTREAM_ORDERS_BASIC_PASSWORD: ${{ secrets.UPSTREAM_ORDERS_BASIC_PASSWORD }}
+          # Las credenciales de upstream NO se pasan aqui: ya estan dentro de las
+          # definiciones de API renderizadas, que llegan en API_DEFINITION_*_B64
+          # desde el paso anterior a traves de GITHUB_ENV.
         run: |
           set -euo pipefail
 

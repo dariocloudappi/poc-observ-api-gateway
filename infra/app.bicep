@@ -111,10 +111,16 @@ param serviceNamespace string = 'poc-observability'
 // son parametros de la plantilla: los consume scripts/render-apis.sh en el
 // pipeline, que produce las definiciones de API ya resueltas. La plantilla solo
 // recibe el resultado, como secreto.
-param tykLogLevel string = 'info'
+// Nivel de log de Tyk (gateway y pump) y del propio colector. En debug por
+// defecto: esta PoC es de formacion, y lo que se busca es ver el detalle de
+// cada salto. Con el colector en debug se ve, linea a linea, cada intento de
+// exportacion hacia New Relic, que es lo unico que distingue "no llega nada
+// al colector" de "el colector no consigue exportar".
+// Para bajar el volumen: variable de repositorio TYK_LOG_LEVEL / OTEL_TELEMETRY_LOG_LEVEL a info.
+param tykLogLevel string = 'debug'
 param tykEnableDetailedRecording string = 'false'
 param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr'
-param otelTelemetryLogLevel string = 'info'
+param otelTelemetryLogLevel string = 'debug'
 
 @description('Master switch for the observability sidecars. When false the pump and the collector are not deployed and the gateway stops emitting telemetry')
 param observabilityEnabled bool = true
@@ -338,26 +344,36 @@ var baseContainers = [
         name: 'TYK_GW_TRACK404LOGS'
         value: 'false'
       }
-      // El transporte logstash de Tyk queda DESACTIVADO a proposito.
+      // Envio de logs del gateway al colector. El TRANSPORTE ES UDP, y esa
+      // eleccion no es cosmetica.
       //
-      // Motivo, reproducido en local: el hook de logstash abre su conexion al
-      // inicializarse y NO reintenta nunca. En Container Apps los contenedores
-      // de una replica arrancan en paralelo sin garantia de orden, asi que el
-      // gateway suele inicializar antes de que el colector escuche en :5170 y
-      // entonces no envia ni una linea durante toda la vida del contenedor.
-      // Ni TCP ni UDP lo salvan: se probaron los dos y ambos dieron 0 logs
-      // cuando el gateway arranca primero. Y aunque se arreglase el orden,
-      // cualquier reinicio del colector volveria a romperlo de forma
-      // permanente.
+      // El hook de logstash de Tyk abre su conexion al inicializarse y NO
+      // reintenta nunca. En Container Apps los contenedores de una replica
+      // arrancan en paralelo sin garantia de orden, y el gateway suele
+      // inicializar antes de que el colector escuche en :5170.
       //
-      // Los logs de los cuatro contenedores salen ahora por el stdout que
-      // recoge la plataforma: appLogsConfiguration en 'azure-monitor' los
-      // convierte en diagnostic logs y de ahi los reenvia New Relic. Ver
-      // foundation.bicep. El colector se queda con trazas y metricas por
-      // OTLP, que si reconectan solas.
+      // Con TCP eso era fatal: connect contra localhost:5170 sin nadie
+      // escuchando da connection refused, el hook muere y el contenedor no
+      // envia ni una linea mientras viva. Medido: 0 registros.
       //
-      // En local no aplica: docker-compose declara depends_on sobre el
-      // colector y ademas usa el driver fluentd, que no existe aqui.
+      // Con UDP no hay conexion que rechazar y localhost siempre resuelve, asi
+      // que el hook se inicializa bien y solo se pierden los datagramas de los
+      // primeros segundos. Medido con el gateway arrancado 25 s antes que el
+      // colector: 22 registros recibidos y exportados a New Relic sin fallos.
+      //
+      // No cambiar a tcp sin volver a medirlo.
+      {
+        name: 'TYK_GW_USELOGSTASH'
+        value: observabilityEnabled ? 'true' : 'false'
+      }
+      {
+        name: 'TYK_GW_LOGSTASHTRANSPORT'
+        value: 'udp'
+      }
+      {
+        name: 'TYK_GW_LOGSTASHNETWORKADDR'
+        value: 'localhost:5170'
+      }
       // Traces
       {
         name: 'TYK_GW_OPENTELEMETRY_ENABLED'
@@ -408,6 +424,14 @@ var baseContainers = [
       '200mb'
       '--maxmemory-policy'
       'allkeys-lru'
+      // Redis en debug, igual que el resto del stack. Con el nivel por defecto
+      // (notice) solo escribe arranque y guardados de RDB, asi que no se ve si
+      // el gateway y el pump estan leyendo y escribiendo de verdad.
+      // ATENCION: en debug Redis registra los comandos que recibe, y el gateway
+      // ejecuta varios por peticion. Es util para la formacion, pero es el
+      // contenedor que mas volumen va a generar de los cuatro.
+      '--loglevel'
+      'debug'
     ]
   }
 ]

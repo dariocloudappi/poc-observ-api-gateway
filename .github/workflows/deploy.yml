@@ -305,7 +305,8 @@ jobs:
           IMAGE_OTEL: ${{ steps.images.outputs.otel }}
           OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
           TYK_ENABLE_DETAILED_RECORDING: ${{ vars.TYK_ENABLE_DETAILED_RECORDING || 'false' }}
-          TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'info' }}
+          TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'debug' }}
+          OTEL_TELEMETRY_LOG_LEVEL: ${{ vars.OTEL_TELEMETRY_LOG_LEVEL || 'debug' }}
           TYK_SECRET: ${{ secrets.TYK_SECRET }}
           TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}

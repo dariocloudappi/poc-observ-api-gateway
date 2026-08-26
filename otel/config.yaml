@@ -10,22 +10,31 @@
 #   TYK_PUMP_METRICS_ENDPOINT host:port of the Tyk Pump prometheus pump
 #   OTEL_TELEMETRY_LOG_LEVEL  collector self-telemetry log level
 #
-# Entrada de logs: SOLO fluentforward (24224), alimentado en local por el
-# driver de logging fluentd de docker compose.
+# Entrada de logs, dos receptores, los dos siempre escuchando:
+#   - fluentforward (24224): en local, alimentado por el driver de logging
+#     fluentd de docker compose.
+#   - udplog (5170): en Azure, alimentado por el transporte logstash de Tyk.
 #
-# En Azure este colector NO procesa logs. El transporte logstash de Tyk se
-# retiro porque su hook abre la conexion al inicializarse y no reintenta
-# nunca: en Container Apps los contenedores de una replica arrancan en
-# paralelo, el gateway suele ganar la carrera al colector y entonces no
-# envia ni una linea. Se probaron TCP y UDP y los dos dieron 0 logs.
-# Alli los logs de los cuatro contenedores salen por stdout, que la
-# plataforma convierte en diagnostic logs de Azure Monitor. Ver
-# infra/modules/foundation.bicep.
+# POR QUE UDP Y NO TCP
+# --------------------
+# El hook de logstash de Tyk abre su conexion al inicializarse y NO reintenta
+# nunca. En Container Apps los contenedores de una replica arrancan en
+# paralelo sin garantia de orden, y el gateway suele ganar la carrera al
+# colector.
 #
-# Consecuencia a tener presente: los logs que llegan por esa via NO pasan
-# por este fichero, asi que no reciben el mapeo de severity, el
-# service.name, la correlacion con trace.id ni el redactado de abajo. Eso
-# solo aplica al flujo local.
+# Con TCP eso es fatal: connect contra localhost:5170 sin nadie escuchando da
+# connection refused, el hook muere y no se envia ni una linea durante toda la
+# vida del contenedor. Medido: 0 registros.
+#
+# Con UDP no: no hay conexion que rechazar y localhost siempre resuelve, asi
+# que el hook se inicializa bien, los primeros datagramas se pierden mientras
+# el colector arranca y a partir de ahi entran todos. Medido en un namespace
+# de red compartido, con el gateway arrancado 25 s antes que el colector: 22
+# registros recibidos y exportados a New Relic sin fallos.
+#
+# El precio es que UDP no garantiza entrega. Para una PoC de formacion es un
+# intercambio razonable: se pierden los primeros segundos de arranque a cambio
+# de que el canal no se pueda romper de forma permanente.
 # =============================================================================
 
 connectors:
@@ -61,6 +70,13 @@ receivers:
   # Local mode: docker fluentd logging driver.
   fluentforward:
     endpoint: 0.0.0.0:24224
+
+  # Azure: transporte logstash de Tyk, un documento JSON por datagrama.
+  udplog/tyk:
+    listen_address: 0.0.0.0:5170
+    add_attributes: false
+    attributes:
+      log.source: tyk-logstash
 
   # Trazas del gateway, en Azure y en local. Este exportador SI reconecta solo
   # si el colector arranca despues, al contrario que el hook de logstash.
@@ -354,6 +370,18 @@ processors:
         action: upsert
 
 exporters:
+
+  # Escribe en el stdout del colector un resumen por lote: cuantos spans,
+  # metricas o logs ha pasado por cada pipeline. Es la unica forma de
+  # distinguir "no entra nada al colector" de "entra pero no consigo
+  # exportarlo a New Relic", y sin eso el diagnostico es a ciegas.
+  #
+  # verbosity basic a proposito, NO detailed: imprime solo contadores. Con
+  # detailed volcaria el contenido de cada registro al log, lo que multiplica
+  # el volumen y ademas sacaria a stdout cabeceras y cuerpos.
+  debug:
+    verbosity: basic
+
   otlphttp/newrelic:
     endpoint: "${env:NR_OTLP_ENDPOINT}"
     headers:
@@ -386,7 +414,7 @@ service:
         - transform/remove_sensitive
         - redaction
         - batch/traces
-      exporters: [otlphttp/newrelic, spanmetrics]
+      exporters: [otlphttp/newrelic, spanmetrics, debug]
 
     # One pipeline per source, so each component can be named explicitly.
     # Splitting is not cosmetic: a processor cannot distinguish which receiver
@@ -400,7 +428,7 @@ service:
         - memory_limiter
         - resource
         - batch/metrics
-      exporters: [otlphttp/newrelic]
+      exporters: [otlphttp/newrelic, debug]
 
     metrics/redis:
       receivers: [redis]
@@ -409,7 +437,7 @@ service:
         - resource
         - resource/redis
         - batch/metrics
-      exporters: [otlphttp/newrelic]
+      exporters: [otlphttp/newrelic, debug]
 
     metrics/tykpump:
       receivers: [prometheus/tykpump]
@@ -418,7 +446,7 @@ service:
         - resource
         - resource/tykpump
         - batch/metrics
-      exporters: [otlphttp/newrelic]
+      exporters: [otlphttp/newrelic, debug]
 
     metrics/collector:
       receivers: [prometheus/collector]
@@ -427,10 +455,10 @@ service:
         - resource
         - resource/collector
         - batch/metrics
-      exporters: [otlphttp/newrelic]
+      exporters: [otlphttp/newrelic, debug]
 
     logs:
-      receivers: [fluentforward]
+      receivers: [fluentforward, udplog/tyk]
       processors:
         - memory_limiter
         - transform/parse_tyk
@@ -439,7 +467,7 @@ service:
         - resource
         - resource/logs
         - batch/logs
-      exporters: [otlphttp/newrelic]
+      exporters: [otlphttp/newrelic, debug]
 
   telemetry:
     logs:

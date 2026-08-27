@@ -490,6 +490,8 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.provision_keys == 'true' }}
         env:
           URL: ${{ steps.app.outputs.url }}
+          TYK_SECRET: ${{ secrets.TYK_SECRET }}
+          TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
           USERNAME_API_USERS: ${{ secrets.USERNAME_API_USERS }}
           PASSWORD_API_USERS: ${{ secrets.PASSWORD_API_USERS }}
           USERNAME_API_ORDERS: ${{ secrets.USERNAME_API_ORDERS }}
@@ -513,9 +515,50 @@ jobs:
             local ok_code
             ok_code=$(curl --silent --output /dev/null --write-out '%{http_code}'               --max-time 30 --user "${user}:${pass}" "${URL}${path}")
 
-            if [ "$ok_code" = "401" ] || [ "$ok_code" = "403" ]; then
-              echo "  ${label}: FALLO -> ${path} devolvio ${ok_code} con la credencial correcta"
+            if [ "$ok_code" = "403" ]; then
+              # 403 y 401 son problemas DISTINTOS, medido contra el gateway:
+              #   403 -> la clave existe y autentica, pero su access_rights
+              #          apunta a un api_id que no coincide con el de la
+              #          definicion de API cargada
+              #   401 -> el usuario no existe en Redis, o la contrasena no casa
+              echo "  ${label}: FALLO -> ${path} devolvio 403"
+              echo "           la credencial autentica, pero su access_rights no"
+              echo "           coincide con el api_id de la definicion de API."
               failed=1
+
+            elif [ "$ok_code" = "401" ]; then
+              echo "  ${label}: FALLO -> ${path} devolvio 401 con la credencial correcta"
+
+              # Aqui esta la pregunta que decide todo: la clave EXISTE en Redis?
+              # Sin esto no se puede distinguir "nunca se creo" de "se creo con
+              # otra contrasena", que se arreglan de formas distintas.
+              # Tyk indexa las claves de basic auth como org_id + usuario.
+              if [ -n "${TYK_SECRET:-}" ]; then
+                local key_code
+                key_code=$(curl --silent --output /dev/null --write-out '%{http_code}'                   --max-time 30 -H "x-tyk-authorization: ${TYK_SECRET}"                   "${URL}/tyk/keys/${TYK_ORG_ID}${user}")
+
+                case "$key_code" in
+                  404)
+                    echo "           DIAGNOSTICO: la clave NO existe en Redis."
+                    echo "           El aprovisionamiento la salto. provision_key.sh omite"
+                    echo "           una API si le falta el usuario O la contrasena, y sigue"
+                    echo "           con la siguiente, por eso la otra API si funciona."
+                    echo "           Revisa que EXISTAN LOS DOS secrets de esta API."
+                    ;;
+                  200)
+                    echo "           DIAGNOSTICO: la clave SI existe en Redis, asi que la"
+                    echo "           contrasena almacenada no coincide con la enviada."
+                    echo "           Suele ser un secret cambiado despues del ultimo"
+                    echo "           aprovisionamiento, o espacios al principio o al final"
+                    echo "           al pegar el valor."
+                    ;;
+                  *)
+                    echo "           No se pudo consultar la clave: la API de admin devolvio ${key_code}"
+                    ;;
+                esac
+              fi
+              failed=1
+
             else
               echo "  ${label}: OK -> ${path} devolvio ${ok_code} (autenticacion superada)"
             fi

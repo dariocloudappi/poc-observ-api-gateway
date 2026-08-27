@@ -52,15 +52,45 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# .env, primero el del repo y luego el de scripts/, para no obligar a moverlo
-for env_file in "$REPO_DIR/.env" "$SCRIPT_DIR/.env"; do
-  if [ -f "$env_file" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$env_file"
-    set +a
-  fi
-done
+# .env, primero el del repo y luego el de scripts/, para no obligar a moverlo.
+#
+# NO se hace con "set -a; . .env", que es lo habitual, porque eso hace que el
+# fichero GANE a lo que pases por linea de comandos:
+#
+#   GATEWAY_BASE_URL=https://otro ./scripts/force-errors.sh
+#
+# se iria silenciosamente al gateway del .env. Aqui el .env solo rellena lo que
+# NO viene ya del entorno, que es el orden que espera cualquiera.
+load_env_file() {
+  local file="$1" line key val
+  # La comilla simple en una variable, porque escribirla dentro de un patron de
+  # case es una fuente inagotable de erratas.
+  local sq="'"
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # sin espacios por delante
+    case "$line" in ''|'#'*) continue ;; esac
+    line="${line#export }"
+    case "$line" in *=*) ;; *) continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    printf '%s' "$key" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' || continue
+    # comillas envolventes fuera, si las hay
+    case "$val" in
+      '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+    esac
+    case "$val" in
+      "$sq"*"$sq") val="${val#$sq}"; val="${val%$sq}" ;;
+    esac
+    # el entorno explicito manda
+    if [ -z "${!key:-}" ]; then
+      export "$key=$val"
+    fi
+  done < "$file"
+}
+
+load_env_file "$REPO_DIR/.env"
+load_env_file "$SCRIPT_DIR/.env"
 
 # -----------------------------------------------------------------------------
 # Valores por defecto

@@ -47,6 +47,14 @@ require_var() {
 
 require_var TYK_SECRET
 
+# jq construye el payload JSON. Sin el, la unica alternativa es interpolar la
+# contrasena en una plantilla, que es justo el fallo que este script evita.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq no esta disponible y es necesario para construir el payload" >&2
+  echo "sin corromper contrasenas que contengan barras invertidas." >&2
+  exit 1
+fi
+
 CURL_OPTS=(--location --fail --silent --show-error)
 if [ "$GATEWAY_ALLOW_INSECURE_TLS" = "true" ]; then
   # Only acceptable against a local self signed certificate.
@@ -72,29 +80,36 @@ for entry in "${APPS[@]}"; do
 
   echo "Creating key for $API_ID (user: $USERNAME)"
 
-  payload=$(cat <<JSON
-{
-  "allowance": 1000,
-  "rate": 1000,
-  "per": 60,
-  "expires": -1,
-  "quota_max": -1,
-  "quota_remaining": -1,
-  "quota_renewal_rate": 60,
-  "org_id": "${TYK_ORG_ID}",
-  "access_rights": {
-    "${API_ID}": {
-      "api_id": "${API_ID}",
-      "api_name": "${API_ID}",
-      "versions": ["Default"]
-    }
-  },
-  "basic_auth_data": {
-    "password": "${PASSWORD}"
-  }
-}
-JSON
-)
+  # El payload se construye con jq y NO interpolando en una plantilla.
+  #
+  # MOTIVO, medido contra el gateway: al meter la contrasena directamente
+  # dentro de una cadena JSON, cualquier barra invertida que forme un escape
+  # JSON valido cambia el valor almacenado SIN dar error. Con una contrasena
+  # que contenga barra-n, barra-t o barra-slash, el aprovisionamiento
+  # respondia 200, la clave quedaba en Redis y el consumidor recibia 401 para
+  # siempre: Tyk habia guardado el escape ya decodificado, distinto de lo que
+  # envia el cliente. Con dos barras seguidas la peticion fallaba con 400.
+  #
+  # jq escapa el valor segun JSON, asi que la contrasena llega intacta sea
+  # cual sea su contenido.
+  payload=$(jq -n \
+    --arg org "$TYK_ORG_ID" \
+    --arg api "$API_ID" \
+    --arg pass "$PASSWORD" \
+    '{
+      allowance: 1000,
+      rate: 1000,
+      per: 60,
+      expires: -1,
+      quota_max: -1,
+      quota_remaining: -1,
+      quota_renewal_rate: 60,
+      org_id: $org,
+      access_rights: {
+        ($api): { api_id: $api, api_name: $api, versions: ["Default"] }
+      },
+      basic_auth_data: { password: $pass }
+    }')
 
   # The admin secret travels in a header, never in the URL or in the logs.
   curl "${CURL_OPTS[@]}" \

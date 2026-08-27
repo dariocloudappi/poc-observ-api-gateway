@@ -73,15 +73,34 @@ wait_for_gateway() {
   return 1
 }
 
+# Escapa un valor para poder meterlo dentro de una cadena JSON.
+#
+# MOTIVO, medido contra el gateway: interpolar la contrasena directamente en la
+# plantilla JSON corrompe en silencio cualquier valor que lleve barra
+# invertida. Con una contrasena que contenga barra-n, barra-t o barra-slash el
+# POST respondia 200, la clave quedaba en Redis y el consumidor recibia 401
+# para siempre, porque Tyk almacenaba el escape ya decodificado y eso no
+# coincide con lo que envia el cliente. Con dos barras seguidas el POST fallaba
+# con 400.
+#
+# Aqui no se puede usar jq: la imagen de curl no lo trae. Se escapa con sed y
+# el ORDEN IMPORTA: primero las barras invertidas, porque si se hiciera al
+# reves se volverian a escapar las que introduce el segundo patron.
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 upsert_key() {
   api_id="$1"
   user="$2"
   pass="$3"
 
+  pass_json=$(json_escape "$pass")
+
   # access_rights se indexa por api_id, asi que este valor DEBE coincidir con el
   # api_id de la definicion de API. Si no coincide, Tyk autentica al usuario
-  # pero responde "Access to this API has been disallowed", que es un sintoma
-  # distinto del 401.
+  # pero responde "Access to this API has been disallowed" con un 403, que es
+  # un sintoma distinto del 401.
   payload=$(cat <<JSON
 {
   "allowance": 1000,
@@ -100,7 +119,7 @@ upsert_key() {
     }
   },
   "basic_auth_data": {
-    "password": "${pass}"
+    "password": "${pass_json}"
   }
 }
 JSON

@@ -357,8 +357,12 @@ jobs:
 
           url=$(echo "$outputs" | jq -r .url.value)
           fqdn=$(echo "$outputs" | jq -r .fqdn.value)
+          app_name=$(echo "$outputs" | jq -r .containerAppName.value)
           echo "url=${url}" >> "$GITHUB_OUTPUT"
           echo "fqdn=${fqdn}" >> "$GITHUB_OUTPUT"
+          # Necesario para los comandos az del resumen del despliegue, que
+          # explican como consultar el usuario y revelar la contrasena.
+          echo "container_app_name=${app_name}" >> "$GITHUB_OUTPUT"
           echo "Gateway published at ${url}"
 
       # ---------------------------------------------------------------------
@@ -612,6 +616,8 @@ jobs:
         env:
           URL: ${{ steps.app.outputs.url }}
           WORKSPACE: ${{ steps.foundation.outputs.workspace_name }}
+          APP_NAME: ${{ steps.app.outputs.container_app_name }}
+          TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
         run: |
           {
             echo "## Tyk OSS PoC deployed"
@@ -623,6 +629,41 @@ jobs:
             echo "| Log Analytics workspace | ${WORKSPACE} |"
             echo "| Region | ${AZURE_LOCATION} |"
             echo "| Image tag | ${GITHUB_SHA::12} |"
+            echo
+            echo "### Credenciales de consumidor"
+            echo
+            echo "En Basic Auth no hay client_id. Los identificadores son el usuario"
+            echo "y el nombre de la clave en Tyk, que es org_id + usuario."
+            echo
+            echo "| API | Nombre de la clave en Tyk | Contrasena |"
+            echo "| --- | --- | --- |"
+            echo "| api-users | \`${TYK_ORG_ID}<USERNAME_API_USERS>\` | secreto \`consumer-password-api-users\` |"
+            echo "| api-orders | \`${TYK_ORG_ID}<USERNAME_API_ORDERS>\` | secreto \`consumer-password-api-orders\` |"
+            echo
+            echo "El usuario y el nombre de la clave estan como variables en claro del"
+            echo "contenedor \`key-provisioner\`, consultables en el portal o con:"
+            echo
+            echo '```bash'
+            echo "az containerapp show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} \\"
+            echo "  --query \"properties.template.containers[?name=='key-provisioner'].env[?starts_with(name,'CONSUMER_KEY_ID')]\" -o table"
+            echo '```'
+            echo
+            echo "Las contrasenas son secretos del container app. Para verlas:"
+            echo
+            echo '```bash'
+            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} \\"
+            echo "  --secret-name consumer-password-api-users"
+            echo '```'
+            echo
+            echo "Y para comprobar si una credencial existe en Redis, con el secreto"
+            echo "de administracion de Tyk:"
+            echo
+            echo '```bash'
+            echo "curl -s -o /dev/null -w '%{http_code}' \\"
+            echo "  -H \"x-tyk-authorization: \$TYK_SECRET\" \\"
+            echo "  ${URL}/tyk/keys/${TYK_ORG_ID}<usuario>"
+            echo "# 200 = existe, 404 = no existe"
+            echo '```'
             echo
             echo "Remember to run the destroy workflow when the PoC is over."
           } >> "$GITHUB_STEP_SUMMARY"

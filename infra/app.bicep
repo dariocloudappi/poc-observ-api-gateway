@@ -555,6 +555,39 @@ var baseContainers = [
         name: 'PASSWORD_API_ORDERS'
         secretRef: 'consumer-password-api-orders'
       }
+      // ----------------------------------------------------------------------
+      // Identidad del consumidor, en claro y consultable desde el portal
+      // ----------------------------------------------------------------------
+      // En Basic Auth NO existe un client_id. Los identificadores son dos:
+      //
+      //   el USUARIO, que es lo que el consumidor pone en la cabecera
+      //   Authorization: Basic base64(usuario:contrasena)
+      //
+      //   el NOMBRE DE LA CLAVE en Tyk, que es org_id + usuario concatenados.
+      //   Tyk indexa asi las claves de basic auth, y es el valor que hay que
+      //   usar contra la API de administracion:
+      //     GET /tyk/keys/{key_id}   ->  200 si existe, 404 si no
+      //
+      // El segundo no es evidente y sin el no se puede comprobar si una
+      // credencial existe. Se publica como variable en claro, no es secreto:
+      // es un identificador derivado del usuario, no una credencial.
+      {
+        name: 'CONSUMER_KEY_ID_API_USERS'
+        value: empty(consumerUserApiUsers) ? '' : '${tykOrgId}${consumerUserApiUsers}'
+      }
+      {
+        name: 'CONSUMER_KEY_ID_API_ORDERS'
+        value: empty(consumerUserApiOrders) ? '' : '${tykOrgId}${consumerUserApiOrders}'
+      }
+      // Las CONTRASENAS siguen siendo secretos del container app y no variables
+      // en claro. Eso NO impide verlas: un secreto de Container Apps se revela
+      // con
+      //   az containerapp secret show -g <rg> -n <app> --secret-name consumer-password-api-users
+      // o desde el portal, en Settings -> Secrets.
+      //
+      // La diferencia con ponerlas como variable en claro es que asi NO quedan
+      // escritas en los metadatos de la revision ni en el historial de
+      // despliegues de la suscripcion, que es de donde no se pueden borrar.
     ]
   }
 ]

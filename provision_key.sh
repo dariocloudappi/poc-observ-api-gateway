@@ -47,6 +47,28 @@ require_var() {
 
 require_var TYK_SECRET
 
+# Detecta espacio en blanco al principio o al final de un valor.
+#
+# MOTIVO, reproducido contra el gateway: un salto de linea o un espacio final
+# en el secret, tipico al pegarlo, se almacena como parte de la contrasena.
+# El aprovisionamiento responde 200, la clave queda en Redis y el consumidor
+# recibe 401 con este mensaje en el log de Tyk:
+#
+#   Attempted access with existing user, failed password check.
+#   crypto/bcrypt: hashedPassword is not the hash of the given password
+#
+# Es invisible: el valor "parece" correcto en todas partes. Por eso se detecta
+# y se ABORTA en lugar de recortarlo en silencio, que dejaria almacenada una
+# contrasena distinta de la del secret y volveria a fallar en cuanto alguien
+# usara el valor original.
+has_edge_space() {
+  local v t
+  v="$1"
+  t="${v#"${v%%[![:space:]]*}"}"
+  t="${t%"${t##*[![:space:]]}"}"
+  [ "$t" != "$v" ]
+}
+
 # jq construye el payload JSON. Sin el, la unica alternativa es interpolar la
 # contrasena en una plantilla, que es justo el fallo que este script evita.
 if ! command -v jq >/dev/null 2>&1; then
@@ -77,6 +99,25 @@ for entry in "${APPS[@]}"; do
     echo "Variables $USER_VAR / $PASS_VAR not defined, skipping $API_ID"
     continue
   fi
+
+  # Se comprueba ANTES de crear la clave: si se crea con la contrasena sucia,
+  # queda una credencial que nadie puede usar.
+  for pair in "USERNAME:$USER_VAR" "PASSWORD:$PASS_VAR"; do
+    which="${pair%%:*}"
+    varname="${pair##*:}"
+    case "$which" in
+      USERNAME) val="$USERNAME" ;;
+      PASSWORD) val="$PASSWORD" ;;
+    esac
+    if has_edge_space "$val"; then
+      echo "ERROR: el secret ${varname} tiene espacio en blanco al principio o al final." >&2
+      echo "Normalmente es un salto de linea al pegarlo. Tyk lo almacenaria como" >&2
+      echo "parte de la credencial y el consumidor recibiria 401 con el mensaje" >&2
+      echo "\"failed password check\" aunque el valor parezca correcto." >&2
+      echo "Vuelve a crear el secret sin el salto de linea final." >&2
+      exit 1
+    fi
+  done
 
   echo "Creating key for $API_ID (user: $USERNAME)"
 

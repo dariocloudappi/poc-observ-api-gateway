@@ -86,6 +86,29 @@ wait_for_gateway() {
 # Aqui no se puede usar jq: la imagen de curl no lo trae. Se escapa con sed y
 # el ORDEN IMPORTA: primero las barras invertidas, porque si se hiciera al
 # reves se volverian a escapar las que introduce el segundo patron.
+# Detecta espacio en blanco al principio o al final de un valor.
+#
+# MOTIVO, reproducido contra el gateway: un salto de linea o un espacio final
+# en el secret, tipico al pegarlo, se almacena como parte de la contrasena. El
+# POST responde 200, la clave queda en Redis y el consumidor recibe 401 con
+# este mensaje en el log de Tyk:
+#
+#   Attempted access with existing user, failed password check.
+#   crypto/bcrypt: hashedPassword is not the hash of the given password
+#
+# Es invisible: el valor parece correcto en todas partes. Se registra el error
+# y se omite esa API en lugar de recortarlo en silencio, que dejaria
+# almacenada una contrasena distinta de la del secret.
+#
+# Expansion de parametros POSIX para que funcione en la shell de la imagen de
+# curl, que no es bash.
+has_edge_space() {
+  v="$1"
+  t="${v#"${v%%[![:space:]]*}"}"
+  t="${t%"${t##*[![:space:]]}"}"
+  [ "$t" != "$v" ]
+}
+
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -192,6 +215,17 @@ process_api() {
       ;;
   esac
 
+  if has_edge_space "$user"; then
+    log "ERROR ${api_id} el secret del USUARIO tiene espacio o salto de linea al principio o al final. Vuelve a crearlo limpio."
+    return 1
+  fi
+  if has_edge_space "$pass"; then
+    log "ERROR ${api_id} el secret de la CONTRASENA tiene espacio o salto de linea al principio o al final."
+    log "      Tyk lo almacenaria como parte de la credencial y el consumidor recibiria 401"
+    log "      con \"failed password check\" aunque el valor parezca correcto. Vuelve a crearlo limpio."
+    return 1
+  fi
+
   # El identificador con el que Tyk indexa la clave. Se registra para poder
   # comprobarla contra la API de administracion:
   #   GET /tyk/keys/<key_id>  ->  200 existe, 404 no existe
@@ -208,8 +242,12 @@ process_api() {
 }
 
 while true; do
-  process_api "api-users-001"  "${USERNAME_API_USERS:-}"  "${PASSWORD_API_USERS:-}"
-  process_api "api-orders-001" "${USERNAME_API_ORDERS:-}" "${PASSWORD_API_ORDERS:-}"
+  # El "|| true" es imprescindible: con set -e, un process_api que devuelve 1
+  # (credencial invalida) abortaria el script y la SEGUNDA API se quedaria sin
+  # credencial por un problema de la primera. Cada API debe fallar por su
+  # cuenta.
+  process_api "api-users-001"  "${USERNAME_API_USERS:-}"  "${PASSWORD_API_USERS:-}"  || true
+  process_api "api-orders-001" "${USERNAME_API_ORDERS:-}" "${PASSWORD_API_ORDERS:-}" || true
 
   sleep "$INTERVAL"
 done

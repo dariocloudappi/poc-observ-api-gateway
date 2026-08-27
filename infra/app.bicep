@@ -142,12 +142,14 @@ param provisionerImage string
 param tykOrgId string = 'poc-organization'
 
 @description('Usuario consumidor de api-users. Vacio = no se mantiene ninguna credencial para esa API')
+@secure()
 param consumerUserApiUsers string = ''
 
 @secure()
 param consumerPasswordApiUsers string = ''
 
 @description('Usuario consumidor de api-orders')
+@secure()
 param consumerUserApiOrders string = ''
 
 @secure()
@@ -541,7 +543,7 @@ var baseContainers = [
       }
       {
         name: 'USERNAME_API_USERS'
-        value: consumerUserApiUsers
+        secretRef: 'consumer-user-api-users'
       }
       {
         name: 'PASSWORD_API_USERS'
@@ -549,14 +551,14 @@ var baseContainers = [
       }
       {
         name: 'USERNAME_API_ORDERS'
-        value: consumerUserApiOrders
+        secretRef: 'consumer-user-api-orders'
       }
       {
         name: 'PASSWORD_API_ORDERS'
         secretRef: 'consumer-password-api-orders'
       }
       // ----------------------------------------------------------------------
-      // Identidad del consumidor, en claro y consultable desde el portal
+      // Identidad del consumidor: donde verla en Azure
       // ----------------------------------------------------------------------
       // En Basic Auth NO existe un client_id. Los identificadores son dos:
       //
@@ -564,30 +566,26 @@ var baseContainers = [
       //   Authorization: Basic base64(usuario:contrasena)
       //
       //   el NOMBRE DE LA CLAVE en Tyk, que es org_id + usuario concatenados.
-      //   Tyk indexa asi las claves de basic auth, y es el valor que hay que
-      //   usar contra la API de administracion:
-      //     GET /tyk/keys/{key_id}   ->  200 si existe, 404 si no
+      //   Es el valor con el que se consulta la API de administracion:
+      //     GET /tyk/keys/<key_id>   ->  200 si existe, 404 si no
       //
-      // El segundo no es evidente y sin el no se puede comprobar si una
-      // credencial existe. Se publica como variable en claro, no es secreto:
-      // es un identificador derivado del usuario, no una credencial.
-      {
-        name: 'CONSUMER_KEY_ID_API_USERS'
-        value: empty(consumerUserApiUsers) ? '' : '${tykOrgId}${consumerUserApiUsers}'
-      }
-      {
-        name: 'CONSUMER_KEY_ID_API_ORDERS'
-        value: empty(consumerUserApiOrders) ? '' : '${tykOrgId}${consumerUserApiOrders}'
-      }
-      // Las CONTRASENAS siguen siendo secretos del container app y no variables
-      // en claro. Eso NO impide verlas: un secreto de Container Apps se revela
-      // con
+      // Usuario y contrasena de las DOS APIs viajan como SECRETOS del container
+      // app, no como variables en claro. Eso no impide verlos:
+      //
+      //   az containerapp secret show -g <rg> -n <app> --secret-name consumer-user-api-users
       //   az containerapp secret show -g <rg> -n <app> --secret-name consumer-password-api-users
-      // o desde el portal, en Settings -> Secrets.
       //
-      // La diferencia con ponerlas como variable en claro es que asi NO quedan
-      // escritas en los metadatos de la revision ni en el historial de
-      // despliegues de la suscripcion, que es de donde no se pueden borrar.
+      // o en el portal, Settings -> Secrets -> Reveal value.
+      //
+      // La diferencia con ponerlos en claro es que asi NO quedan escritos en los
+      // metadatos de la revision ni en el historial de despliegues de la
+      // suscripcion, de donde no se pueden borrar.
+      //
+      // El key_id no se publica como variable porque se derivaria del usuario,
+      // que es secreto. En su lugar el sidecar lo escribe en su log en cada
+      // ciclo, con la linea:
+      //   provisioner: api-users-001 key_id=<org><usuario>
+      // visible en el log stream del container app y en New Relic.
     ]
   }
 ]
@@ -652,8 +650,16 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         // gateway en si no las usa. Se guarda un espacio y no una cadena vacia:
         // Container Apps rechaza un secreto con valor vacio.
         {
+          name: 'consumer-user-api-users'
+          value: empty(consumerUserApiUsers) ? ' ' : consumerUserApiUsers
+        }
+        {
           name: 'consumer-password-api-users'
           value: empty(consumerPasswordApiUsers) ? ' ' : consumerPasswordApiUsers
+        }
+        {
+          name: 'consumer-user-api-orders'
+          value: empty(consumerUserApiOrders) ? ' ' : consumerUserApiOrders
         }
         {
           name: 'consumer-password-api-orders'

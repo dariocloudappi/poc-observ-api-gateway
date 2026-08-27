@@ -149,25 +149,67 @@ if [ -z "${USERNAME_API_USERS:-}" ] && [ -z "${USERNAME_API_ORDERS:-}" ]; then
   while true; do sleep 3600; done
 fi
 
+# Procesa una API. Los valores se pasan como ARGUMENTOS SEPARADOS.
+#
+# La version anterior los empaquetaba en una cadena "api:usuario:contrasena" y
+# los separaba con cut -d: -f3. Era un bug: cualquier contrasena que contuviese
+# dos puntos quedaba TRUNCADA en el primero. Con "Pa:ss" se guardaba "Pa", el
+# aprovisionamiento respondia 200 y el consumidor recibia 401 para siempre.
+# Y afectaba solo a la API cuya contrasena tuviera dos puntos, lo que hacia
+# parecer que las dos APIs se comportaban de forma distinta.
+#
+# Con argumentos separados no hay separador que colisione con el contenido.
+process_api() {
+  api_id="$1"
+  user="$2"
+  pass="$3"
+
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    log "${api_id} sin credenciales configuradas, se omite"
+    return 0
+  fi
+
+  # Los dos puntos son IMPOSIBLES en Basic Auth, y hay que detectarlo aqui
+  # porque el sintoma es enganoso: la clave se crea sin error y el consumidor
+  # recibe un 400, no un 401.
+  #
+  # Medido contra el gateway: con dos puntos en la contrasena Tyk registra
+  #   "Attempted access with malformed header, values not in basic auth format."
+  # y responde 400. El motivo es la propia especificacion: la cabecera lleva
+  # base64(usuario:contrasena) y se parte por el PRIMER dos puntos, asi que un
+  # dos puntos en el usuario es irrepresentable y Tyk exige exactamente dos
+  # partes, lo que descarta tenerlo tambien en la contrasena.
+  case "$user" in
+    *:*)
+      log "ERROR ${api_id} el USUARIO contiene ':' y Basic Auth no lo admite. Cambia el secret."
+      return 1
+      ;;
+  esac
+  case "$pass" in
+    *:*)
+      log "ERROR ${api_id} la CONTRASENA contiene ':' y Tyk la rechaza con 400. Cambia el secret."
+      return 1
+      ;;
+  esac
+
+  # El identificador con el que Tyk indexa la clave. Se registra para poder
+  # comprobarla contra la API de administracion:
+  #   GET /tyk/keys/<key_id>  ->  200 existe, 404 no existe
+  # No es un secreto: es el usuario con el org delante.
+  log "${api_id} key_id=${ORG}${user}"
+
+  if upsert_key "$api_id" "$user" "$pass"; then
+    log "${api_id} credencial escrita"
+  else
+    # No se aborta: el gateway puede estar recargando definiciones. El
+    # siguiente ciclo lo reintenta.
+    log "AVISO no se pudo escribir la credencial de ${api_id}, se reintenta en ${INTERVAL}s"
+  fi
+}
+
 while true; do
-  for entry in "api-users-001:${USERNAME_API_USERS:-}:${PASSWORD_API_USERS:-}" \
-               "api-orders-001:${USERNAME_API_ORDERS:-}:${PASSWORD_API_ORDERS:-}"; do
-    api_id=$(echo "$entry" | cut -d: -f1)
-    user=$(echo "$entry" | cut -d: -f2)
-    pass=$(echo "$entry" | cut -d: -f3)
-
-    if [ -z "$user" ] || [ -z "$pass" ]; then
-      continue
-    fi
-
-    if upsert_key "$api_id" "$user" "$pass"; then
-      log "${api_id} credencial escrita"
-    else
-      # No se aborta: el gateway puede estar recargando definiciones. El
-      # siguiente ciclo lo reintenta.
-      log "AVISO no se pudo escribir la credencial de ${api_id}, se reintenta en ${INTERVAL}s"
-    fi
-  done
+  process_api "api-users-001"  "${USERNAME_API_USERS:-}"  "${PASSWORD_API_USERS:-}"
+  process_api "api-orders-001" "${USERNAME_API_ORDERS:-}" "${PASSWORD_API_ORDERS:-}"
 
   sleep "$INTERVAL"
 done

@@ -533,6 +533,34 @@ jobs:
             elif [ "$ok_code" = "401" ]; then
               echo "  ${label}: FALLO -> ${path} devolvio 401 con la credencial correcta"
 
+              # De donde viene el 401? Tyk y el upstream devuelven los dos un
+              # 401 y se distinguen por el CUERPO, medido contra el gateway:
+              #
+              #   Tyk       -> {"error": "User not authorised"}
+              #   upstream  -> lo que devuelva el micro, sin esa firma
+              #
+              # Distinguirlo es clave: el primero se arregla con los secrets
+              # USERNAME_API_* / PASSWORD_API_*, y el segundo con los
+              # UPSTREAM_*_BASIC_*, que son credenciales DISTINTAS. Tyk
+              # sustituye la cabecera Authorization del consumidor por la del
+              # upstream antes de reenviar, asi que un 401 del micro no tiene
+              # nada que ver con la credencial que uso el cliente.
+              local body
+              body=$(curl --silent --max-time 30 --user "${user}:${pass}" "${URL}${path}" || true)
+
+              if printf '%s' "$body" | grep -q 'User not authorised'; then
+                echo "           ORIGEN: el GATEWAY. El cuerpo lleva la firma de Tyk."
+              else
+                echo "           ORIGEN: el UPSTREAM, no el gateway. El cuerpo no lleva"
+                echo "           la firma de Tyk, asi que la autenticacion de consumidor"
+                echo "           PASO y es el microservicio el que rechaza."
+                echo "           Revisa UPSTREAM_${label##api-}_BASIC_USER y _BASIC_PASSWORD"
+                echo "           de ESTE repo contra BASIC_AUTH_USER y BASIC_AUTH_PASSWORD"
+                echo "           del repo del microservicio: deben coincidir."
+                failed=1
+                return 0
+              fi
+
               # Aqui esta la pregunta que decide todo: la clave EXISTE en Redis?
               # Sin esto no se puede distinguir "nunca se creo" de "se creo con
               # otra contrasena", que se arreglan de formas distintas.
@@ -635,33 +663,31 @@ jobs:
             echo "En Basic Auth no hay client_id. Los identificadores son el usuario"
             echo "y el nombre de la clave en Tyk, que es org_id + usuario."
             echo
-            echo "| API | Nombre de la clave en Tyk | Contrasena |"
-            echo "| --- | --- | --- |"
-            echo "| api-users | \`${TYK_ORG_ID}<USERNAME_API_USERS>\` | secreto \`consumer-password-api-users\` |"
-            echo "| api-orders | \`${TYK_ORG_ID}<USERNAME_API_ORDERS>\` | secreto \`consumer-password-api-orders\` |"
-            echo
-            echo "El usuario y el nombre de la clave estan como variables en claro del"
-            echo "contenedor \`key-provisioner\`, consultables en el portal o con:"
+            echo "Usuario y contrasena de las dos APIs son SECRETOS del container app."
+            echo "Para verlos:"
             echo
             echo '```bash'
-            echo "az containerapp show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} \\"
-            echo "  --query \"properties.template.containers[?name=='key-provisioner'].env[?starts_with(name,'CONSUMER_KEY_ID')]\" -o table"
+            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} --secret-name consumer-user-api-users"
+            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} --secret-name consumer-password-api-users"
+            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} --secret-name consumer-user-api-orders"
+            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} --secret-name consumer-password-api-orders"
             echo '```'
             echo
-            echo "Las contrasenas son secretos del container app. Para verlas:"
+            echo "O en el portal: Container App -> Settings -> Secrets -> Reveal value."
+            echo
+            echo "El nombre de la clave en Tyk lo escribe el sidecar en su log en cada"
+            echo "ciclo, con la linea \`provisioner: <api> key_id=<org><usuario>\`:"
             echo
             echo '```bash'
-            echo "az containerapp secret show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} \\"
-            echo "  --secret-name consumer-password-api-users"
+            echo "az containerapp logs show -g ${AZURE_RESOURCE_GROUP} -n ${APP_NAME} --container key-provisioner --tail 20"
             echo '```'
             echo
-            echo "Y para comprobar si una credencial existe en Redis, con el secreto"
-            echo "de administracion de Tyk:"
+            echo "Y para comprobar si una credencial existe en Redis:"
             echo
             echo '```bash'
             echo "curl -s -o /dev/null -w '%{http_code}' \\"
             echo "  -H \"x-tyk-authorization: \$TYK_SECRET\" \\"
-            echo "  ${URL}/tyk/keys/${TYK_ORG_ID}<usuario>"
+            echo "  ${URL}/tyk/keys/<key_id>"
             echo "# 200 = existe, 404 = no existe"
             echo '```'
             echo

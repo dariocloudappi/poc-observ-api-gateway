@@ -119,7 +119,20 @@ for entry in "${APPS[@]}"; do
     fi
   done
 
+  # HUELLA de la credencial, para poder comparar lo que se ESCRIBE aqui con lo
+  # que luego se ENVIA al verificar, sin revelar el valor.
+  #
+  # Existe porque el sintoma era irreproducible por deduccion: la pipeline crea
+  # la clave y la comprueba con el MISMO secret, asi que deberia funcionar
+  # siempre. Cuando no funciona, significa que algo transforma el valor en uno
+  # de los dos caminos. Comparando longitud y hash se ve de inmediato si el
+  # valor escrito y el enviado son el mismo, y cuando dejan de serlo.
+  fingerprint() {
+    printf '%s' "$1" | sha256sum | cut -c1-12
+  }
   echo "Creating key for $API_ID (user: $USERNAME)"
+  echo "  huella usuario:    len=${#USERNAME} sha=$(fingerprint "$USERNAME")"
+  echo "  huella contrasena: len=${#PASSWORD} sha=$(fingerprint "$PASSWORD")"
 
   # El payload se construye con jq y NO interpolando en una plantilla.
   #

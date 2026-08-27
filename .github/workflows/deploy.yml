@@ -608,6 +608,26 @@ jobs:
             fi
           }
 
+          # Misma huella que imprime provision_key.sh al crear la clave. Si las
+          # dos coinciden, el valor escrito y el enviado son identicos y el 401
+          # no puede venir de la credencial. Si difieren, algo la transforma
+          # entre los dos caminos y aqui se ve exactamente donde.
+          fingerprint() {
+            printf '%s' "$1" | sha256sum | cut -c1-12
+          }
+
+          echo "Huellas de lo que se va a ENVIAR (comparar con las del paso de aprovisionamiento):"
+          for pair in "api-users:${USERNAME_API_USERS}:${PASSWORD_API_USERS}"                       "api-orders:${USERNAME_API_ORDERS}:${PASSWORD_API_ORDERS}"; do
+            lbl="${pair%%:*}"
+            rest="${pair#*:}"
+            u="${rest%%:*}"
+            pw="${rest#*:}"
+            if [ -n "$u" ]; then
+              echo "  ${lbl}: usuario len=${#u} sha=$(fingerprint "$u") | contrasena len=${#pw} sha=$(fingerprint "$pw")"
+            fi
+          done
+          echo
+
           echo "Comprobando que el gateway acepta las credenciales aprovisionadas:"
           check "api-users"  "/api-users/v1/users"  "$USERNAME_API_USERS"  "$PASSWORD_API_USERS"
           check "api-orders" "/api-orders/v1"      "$USERNAME_API_ORDERS" "$PASSWORD_API_ORDERS"

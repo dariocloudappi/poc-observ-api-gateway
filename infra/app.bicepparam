@@ -54,4 +54,4 @@ param tykLogLevel = readEnvironmentVariable('TYK_LOG_LEVEL', 'debug')
 // Antes no se leia del entorno, asi que el nivel del colector se quedaba
 // siempre en el default de la plantilla y no habia forma de subirlo sin
 // editar el bicep.
-param otelTelemetryLogLevel = readEnvironmentVariable('OTEL_TELEMETRY_LOG_LEVEL', 'debug')
+param otelTelemetryLogLevel = readEnvironmentVariable('OTEL_TELEMETRY_LOG_LEVEL', 'info')

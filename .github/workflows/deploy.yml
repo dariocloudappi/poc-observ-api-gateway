@@ -276,8 +276,8 @@ jobs:
           bash scripts/render-apis.sh tyk/apps-rendered
 
           # base64 en una sola linea, para pasarlo por variable de entorno.
-          users_b64=$(base64 -w0 tyk/apps-rendered/microservice-users.json)
-          orders_b64=$(base64 -w0 tyk/apps-rendered/microservice-orders.json)
+          users_b64=$(base64 -w0 tyk/apps-rendered/api-users.json)
+          orders_b64=$(base64 -w0 tyk/apps-rendered/api-orders.json)
 
           # Contienen credenciales: enmascarar antes de que puedan aparecer.
           echo "::add-mask::${users_b64}"
@@ -306,7 +306,7 @@ jobs:
           OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
           TYK_ENABLE_DETAILED_RECORDING: ${{ vars.TYK_ENABLE_DETAILED_RECORDING || 'false' }}
           TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'debug' }}
-          OTEL_TELEMETRY_LOG_LEVEL: ${{ vars.OTEL_TELEMETRY_LOG_LEVEL || 'debug' }}
+          OTEL_TELEMETRY_LOG_LEVEL: ${{ vars.OTEL_TELEMETRY_LOG_LEVEL || 'info' }}
           TYK_SECRET: ${{ secrets.TYK_SECRET }}
           TYK_NODE_SECRET: ${{ secrets.TYK_NODE_SECRET }}
           NR_LICENSE_KEY: ${{ secrets.NR_LICENSE_KEY }}

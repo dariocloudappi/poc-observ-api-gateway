@@ -78,6 +78,24 @@ receivers:
     attributes:
       log.source: tyk-logstash
 
+  # Logs de los sidecars que NO pueden enviarlos por red.
+  #
+  # En Container Apps no se puede fijar el log driver de un contenedor ni leer
+  # el stdout de otro, asi que cada uno escribe a un fichero en un volumen
+  # EmptyDir compartido y este receptor los sigue. Ver infra/app.bicep.
+  #
+  #   redis.log      Redis, con --logfile
+  #   collector.log  este propio colector, con service.telemetry.logs.output_paths
+  #
+  filelog/sidecars:
+    include:
+      - /var/log/pod/*.log
+    start_at: beginning
+    include_file_name: true
+    include_file_path: false
+    # Sin esto, un fichero que rota o se trunca se releeria entero.
+    fingerprint_size: 1kb
+
   # Trazas del gateway, en Azure y en local. Este exportador SI reconecta solo
   # si el colector arranca despues, al contrario que el hook de logstash.
   otlp:
@@ -270,6 +288,60 @@ processors:
           - delete_key(attributes, "trace_id")
             where attributes["trace_id"] != nil
 
+  # service.name segun el fichero del que viene el registro. Sin esto todos los
+  # logs de los sidecars caerian bajo tyk-gateway, que es el default que aplica
+  # transform/parse_tyk, y en New Relic serian indistinguibles.
+  transform/name_sidecar_logs:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["service.name"], "tyk-redis")
+            where attributes["log.file.name"] == "redis.log"
+          - set(attributes["service.instance.id"], "tyk-redis")
+            where attributes["log.file.name"] == "redis.log"
+
+          - set(attributes["service.name"], "otel-collector")
+            where attributes["log.file.name"] == "collector.log"
+          - set(attributes["service.instance.id"], "otel-collector")
+            where attributes["log.file.name"] == "collector.log"
+
+          - set(attributes["log.source"], "sidecar-file")
+            where attributes["log.file.name"] != nil
+
+          # Nivel de los logs de Redis. Su formato es texto plano, no JSON, asi
+          # que transform/parse_tyk no le aplica: el nivel va en un caracter
+          # tras la fecha, "*" informativo y "#" aviso o error.
+          #
+          # Los marcadores van como clase de caracteres, [*] y [#], y no
+          # escapados. Dos motivos: OTTL rechaza la barra invertida dentro de
+          # sus cadenas entrecomilladas, y un "#" precedido de espacio haria
+          # que YAML tomase el resto de la linea por un comentario. Dentro de
+          # los corchetes no pasa ninguna de las dos cosas.
+          - set(severity_number, 9)
+            where attributes["log.file.name"] == "redis.log" and IsMatch(body, "[0-9]+:[A-Z] .* [*] ")
+          - set(severity_number, 13)
+            where attributes["log.file.name"] == "redis.log" and IsMatch(body, "[0-9]+:[A-Z] .* [#] ")
+          - set(severity_text, "info")
+            where attributes["log.file.name"] == "redis.log" and severity_number == 9
+          - set(severity_text, "warning")
+            where attributes["log.file.name"] == "redis.log" and severity_number == 13
+
+  # ROMPE EL BUCLE DE REALIMENTACION. Sin esto el colector se autoalimenta:
+  # ingiere sus propios logs, cada exportacion de logs escribe una linea de
+  # debug en collector.log, filelog la lee, genera otro registro, que provoca
+  # otra exportacion, que escribe otra linea. Con OTEL_TELEMETRY_LOG_LEVEL en
+  # debug la amplificacion es inmediata y no converge.
+  #
+  # Se descartan las lineas del propio colector que hablan de exportar o
+  # procesar telemetria, y se conserva lo que de verdad interesa vigilar:
+  # arranque, errores, memory_limiter y datos rechazados.
+  filter/break_collector_loop:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'attributes["log.file.name"] == "collector.log" and IsMatch(body, ".*(Exporter|otlphttp|Preparing to make HTTP request|batch|sending_queue|TracesExporter|MetricsExporter|LogsExporter).*")'
+
   filter/drop_noisy_logs:
     error_mode: ignore
     logs:
@@ -300,7 +372,14 @@ processors:
           # como variable de entorno.
           # ------------------------------------------------------------
 
-          - replace_pattern(body, "(?i)(bearer|basic) +[A-Za-z0-9+/=._-]+", "REDACTED")
+          # El cuantificador {16,} NO es cosmetico. Con "+" a secas este patron
+          # matcheaba las PALABRAS "basic auth" del mensaje de error de Tyk
+          #   Base64 Decoding failed of basic auth data: illegal base64 data...
+          # y lo convertia en "... of REDACTED data: ...", destruyendo justo el
+          # diagnostico que hacia falta para entender un 400. Una credencial
+          # real en base64 pasa de 16 caracteres; palabras como "auth" o "data"
+          # no llegan, asi que sobreviven al redactado.
+          - replace_pattern(body, "(?i)(bearer|basic) +[A-Za-z0-9+/=._-]{16,}", "REDACTED")
             where IsString(body)
 
           - replace_pattern(body, "[a-f0-9]{64}", "REDACTED")
@@ -458,10 +537,14 @@ service:
       exporters: [otlphttp/newrelic, debug]
 
     logs:
-      receivers: [fluentforward, udplog/tyk]
+      receivers: [fluentforward, udplog/tyk, filelog/sidecars]
       processors:
         - memory_limiter
+        # El corta-bucles va PRIMERO: cuanto antes se descarte la
+        # realimentacion, menos trabajo inutil hace el resto del pipeline.
+        - filter/break_collector_loop
         - transform/parse_tyk
+        - transform/name_sidecar_logs
         - filter/drop_noisy_logs
         - transform/remove_sensitive
         - resource
@@ -472,5 +555,12 @@ service:
   telemetry:
     logs:
       level: "${env:OTEL_TELEMETRY_LOG_LEVEL}"
+      # Duplica los logs del colector a un fichero del volumen compartido para
+      # que filelog/sidecars los recoja. stdout se mantiene: sin el, el log
+      # stream de Container Apps se queda vacio y se pierde la unica forma de
+      # depurar el colector cuando no consigue exportar.
+      output_paths:
+        - stdout
+        - /var/log/pod/collector.log
     metrics:
       address: 0.0.0.0:8888

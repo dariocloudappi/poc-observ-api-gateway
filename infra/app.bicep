@@ -111,16 +111,25 @@ param serviceNamespace string = 'poc-observability'
 // son parametros de la plantilla: los consume scripts/render-apis.sh en el
 // pipeline, que produce las definiciones de API ya resueltas. La plantilla solo
 // recibe el resultado, como secreto.
-// Nivel de log de Tyk (gateway y pump) y del propio colector. En debug por
-// defecto: esta PoC es de formacion, y lo que se busca es ver el detalle de
-// cada salto. Con el colector en debug se ve, linea a linea, cada intento de
-// exportacion hacia New Relic, que es lo unico que distingue "no llega nada
-// al colector" de "el colector no consigue exportar".
-// Para bajar el volumen: variable de repositorio TYK_LOG_LEVEL / OTEL_TELEMETRY_LOG_LEVEL a info.
+// Nivel de log de Tyk, gateway y pump. En debug: es una PoC de formacion y lo
+// que se busca es ver el detalle de cada salto, incluido el middleware que
+// rechaza una peticion.
+// Para bajar el volumen: variable de repositorio TYK_LOG_LEVEL a info.
 param tykLogLevel string = 'debug'
 param tykEnableDetailedRecording string = 'false'
 param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr'
-param otelTelemetryLogLevel string = 'debug'
+// El colector va en INFO y no en debug, al contrario que el resto.
+//
+// Motivo medido: sus propios logs se ingieren ahora por filelog, y en debug
+// generaba 3,6 registros por segundo de forma sostenida, unos 300.000 al dia.
+// Eso hacia que la telemetria del colector dominase la ingesta de la cuenta
+// sin aportar nada una vez confirmado que el envio funciona.
+//
+// En info sigue registrando lo que importa vigilar: arranque, errores de
+// exportacion, memory_limiter y datos rechazados. Subelo a debug solo mientras
+// diagnostiques por que no llega algo, con la variable de repositorio
+// OTEL_TELEMETRY_LOG_LEVEL.
+param otelTelemetryLogLevel string = 'info'
 
 @description('Master switch for the observability sidecars. When false the pump and the collector are not deployed and the gateway stops emitting telemetry')
 param observabilityEnabled bool = true
@@ -225,6 +234,15 @@ var observabilityContainers = [
       {
         name: 'OTEL_TELEMETRY_LOG_LEVEL'
         value: otelTelemetryLogLevel
+      }
+    ]
+    // Mismo volumen que Redis: el colector LEE de aqui con el receptor filelog
+    // y a la vez ESCRIBE aqui sus propios logs, via
+    // service.telemetry.logs.output_paths en otel/config.yaml.
+    volumeMounts: [
+      {
+        volumeName: 'container-logs'
+        mountPath: '/var/log/pod'
       }
     ]
   }
@@ -432,6 +450,19 @@ var baseContainers = [
       // contenedor que mas volumen va a generar de los cuatro.
       '--loglevel'
       'debug'
+      // Redis escribe TAMBIEN a fichero para que el colector pueda leerlo. Con
+      // logfile a un path, Redis deja de escribir a stdout, asi que sus logs
+      // pasan a viajar solo por el colector. Es lo que se quiere: van a New
+      // Relic con service.name = tyk-redis en lugar de quedarse en el stream
+      // de la plataforma.
+      '--logfile'
+      '/var/log/pod/redis.log'
+    ]
+    volumeMounts: [
+      {
+        volumeName: 'container-logs'
+        mountPath: '/var/log/pod'
+      }
     ]
   }
 ]
@@ -507,17 +538,29 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       // es lo que permite que se llamen *.json, que es lo que Tyk busca: un
       // nombre de secreto no admite puntos.
       volumes: [
+        // Volumen efimero compartido por los contenedores de la replica. Es la
+        // unica via para que el colector lea los logs de sus vecinos: en
+        // Container Apps no se puede fijar el log driver de un contenedor ni
+        // leer el stdout de otro, asi que cada uno escribe a un fichero aqui y
+        // el receptor filelog los sigue.
+        //
+        // EmptyDir vive y muere con la replica. No es persistencia, y no hace
+        // falta: los logs se exportan a New Relic en segundos.
+        {
+          name: 'container-logs'
+          storageType: 'EmptyDir'
+        }
         {
           name: 'api-definitions'
           storageType: 'Secret'
           secrets: [
             {
               secretRef: 'api-definition-users'
-              path: 'microservice-users.json'
+              path: 'api-users.json'
             }
             {
               secretRef: 'api-definition-orders'
-              path: 'microservice-orders.json'
+              path: 'api-orders.json'
             }
           ]
         }

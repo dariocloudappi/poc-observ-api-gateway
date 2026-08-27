@@ -1,7 +1,7 @@
 {
-  "name": "microservice-orders",
-  "slug": "microservice-orders",
-  "api_id": "microservice-orders-001",
+  "name": "api-orders",
+  "slug": "api-orders",
+  "api_id": "api-orders-001",
   "org_id": "%%TYK_ORG_ID%%",
   "use_keyless": false,
   "detailed_tracing": %%TYK_DETAILED_TRACING%%,

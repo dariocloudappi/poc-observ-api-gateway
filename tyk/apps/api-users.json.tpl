@@ -1,7 +1,7 @@
 {
-  "name": "microservice-users",
-  "slug": "microservice-users",
-  "api_id": "microservice-users-001",
+  "name": "api-users",
+  "slug": "api-users",
+  "api_id": "api-users-001",
   "org_id": "%%TYK_ORG_ID%%",
   "use_keyless": false,
   "detailed_tracing": %%TYK_DETAILED_TRACING%%,

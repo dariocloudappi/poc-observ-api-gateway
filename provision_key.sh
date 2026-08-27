@@ -56,8 +56,8 @@ fi
 
 # api_id : user variable : password variable
 APPS=(
-  "microservice-users-001:USERNAME_API_USERS:PASSWORD_API_USERS"
-  "microservice-orders-001:USERNAME_API_ORDERS:PASSWORD_API_ORDERS"
+  "api-users-001:USERNAME_API_USERS:PASSWORD_API_USERS"
+  "api-orders-001:USERNAME_API_ORDERS:PASSWORD_API_ORDERS"
 )
 
 for entry in "${APPS[@]}"; do

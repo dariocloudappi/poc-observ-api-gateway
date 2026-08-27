@@ -1,0 +1,595 @@
+{
+  "info": {
+    "name": "PoC Observabilidad - Tyk API Gateway",
+    "description": "Flujo de extremo a extremo a traves del gateway de Tyk: crear usuario, crear orden, consultarla y comprobar el estado de la cadena.\n\nBUENAS PRACTICAS APLICADAS\n- Ningun secreto vive en la coleccion. Todos son variables de ENTORNO de tipo secret, asi que la coleccion se puede compartir y versionar sin riesgo.\n- La autenticacion se define A NIVEL DE CARPETA, no en cada peticion: users y orders usan credenciales distintas y cada carpeta hereda la suya.\n- Las peticiones se encadenan solas. Crear usuario guarda userId y crear orden guarda orderId en variables de coleccion, asi que el flujo corre con el Collection Runner sin copiar ids a mano.\n- Cada peticion captura X-Trace-Id y escribe en la consola la NRQL lista para encontrar sus logs en New Relic.\n- Los tests comprueban comportamiento, no solo el codigo de estado: el total que calcula el servicio, el estado inicial de la orden y su pertenencia al usuario.\n\nORDEN DE EJECUCION\nLas carpetas estan numeradas. Con el Collection Runner ejecutalas en orden: 0 diagnostico, 1 usuarios, 2 ordenes. La carpeta 3 es administracion y solo se usa para reparar credenciales.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0. Diagnostico",
+      "description": "Comprobaciones que no necesitan credencial. Sirven para saber si el gateway esta vivo y si la autenticacion esta realmente activa.",
+      "auth": {
+        "type": "noauth"
+      },
+      "item": [
+        {
+          "name": "Salud del gateway",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/hello",
+            "description": "Endpoint propio de Tyk. No toca upstream ni base de datos, asi que un /hello lento apunta al contenedor del gateway y no a los microservicios."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"el gateway responde 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Sin credencial debe dar 401",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-users/v1/status",
+            "description": "Control negativo. Si esto NO devuelve 401, la API esta sin autenticacion (use_keyless) y cualquier comprobacion posterior es enganosa."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"rechaza el trafico anonimo\", function () {",
+                  "    pm.expect([400, 401]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. Usuarios (api-users)",
+      "description": "API de usuarios publicada en /api-users/v1. Con strip_listen_path activo el microservicio recibe la ruta sin ese prefijo.",
+      "auth": {
+        "type": "basic",
+        "basic": [
+          {
+            "key": "username",
+            "value": "{{usersConsumerUser}}",
+            "type": "string"
+          },
+          {
+            "key": "password",
+            "value": "{{usersConsumerPassword}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "Crear usuario",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{gatewayUrl}}/api-users/v1/users",
+            "description": "PASO 1 DEL FLUJO. Obligatorio antes de crear una orden: orders valida al propietario contra esta API, tambien a traves del gateway. Sin usuario, la creacion de la orden devuelve 404.\n\nEl id se guarda en userId automaticamente.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Ada Lovelace\",\n  \"email\": \"ada.lovelace@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"usuario creado con 201\", function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "// Las respuestas de users van envueltas en data.",
+                  "const body = pm.response.json();",
+                  "pm.test(\"devuelve el id dentro de data\", function () {",
+                  "    pm.expect(body.data).to.have.property(\"id\");",
+                  "});",
+                  "",
+                  "// Encadenado: sin esto habria que copiar el id a mano en cada peticion.",
+                  "pm.collectionVariables.set(\"userId\", body.data.id);",
+                  "console.log(\"userId = \" + body.data.id);",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Obtener usuario",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-users/v1/users/{{userId}}",
+            "description": "Usa el userId capturado al crear. Devuelve nombre y email dentro de data."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"el id coincide con el solicitado\", function () {",
+                  "    pm.expect(pm.response.json().data.id).to.eql(pm.collectionVariables.get(\"userId\"));",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar usuarios",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-users/v1/users",
+            "description": "Listado completo. Util para comprobar que la base de datos responde con datos reales."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Estado",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-users/v1/status",
+            "description": "Comprueba la base de datos. Este micro devuelve 503 si algo esta degradado, al contrario que orders."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"el estado es 200 o 503\", function () {",
+                  "    pm.expect([200, 503]).to.include(pm.response.code);",
+                  "});",
+                  "pm.test(\"la base de datos responde\", function () {",
+                  "    const svc = pm.response.json().services.find(function (s) { return s.service === \"database\"; });",
+                  "    pm.expect(svc.status).to.eql(\"ok\");",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Ordenes (api-orders)",
+      "description": "API de ordenes publicada en /api-orders/v1.\n\nOJO: las credenciales son DISTINTAS de las de users. Tyk indexa las claves como org_id + usuario, asi que reutilizar el mismo usuario para las dos APIs hace que una sobrescriba a la otra y una de las dos empiece a devolver 401.",
+      "auth": {
+        "type": "basic",
+        "basic": [
+          {
+            "key": "username",
+            "value": "{{ordersConsumerUser}}",
+            "type": "string"
+          },
+          {
+            "key": "password",
+            "value": "{{ordersConsumerPassword}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "Crear orden",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{gatewayUrl}}/api-orders/v1/users/{{userId}}/orders",
+            "description": "PASO 2 DEL FLUJO. Requiere que el usuario exista.\n\nEl servicio calcula totalAmount como la suma de quantity * unitPrice y fuerza status a PENDING; ninguno de los dos se envia. items no puede ir vacio y cada linea exige los cuatro campos.\n\nEl id se guarda en orderId automaticamente.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    {\n      \"productId\": \"SKU-1001\",\n      \"productName\": \"Teclado mecanico\",\n      \"quantity\": 2,\n      \"unitPrice\": 89.9\n    },\n    {\n      \"productId\": \"SKU-2042\",\n      \"productName\": \"Raton ergonomico\",\n      \"quantity\": 1,\n      \"unitPrice\": 45.5\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"orden creada con 201\", function () {",
+                  "    pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "// orders NO envuelve en data, al contrario que users.",
+                  "const order = pm.response.json();",
+                  "",
+                  "pm.test(\"el total lo calcula el servicio\", function () {",
+                  "    const esperado = order.items.reduce(function (t, i) { return t + i.quantity * i.unitPrice; }, 0);",
+                  "    pm.expect(order.totalAmount).to.be.closeTo(esperado, 0.001);",
+                  "});",
+                  "pm.test(\"arranca en PENDING\", function () {",
+                  "    pm.expect(order.status).to.eql(\"PENDING\");",
+                  "});",
+                  "pm.test(\"pertenece al usuario creado\", function () {",
+                  "    pm.expect(order.userId).to.eql(pm.collectionVariables.get(\"userId\"));",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set(\"orderId\", order.id);",
+                  "console.log(\"orderId = \" + order.id);",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Consultar orden",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-orders/v1/users/{{userId}}/orders/{{orderId}}",
+            "description": "PASO 3 DEL FLUJO. La orden se devuelve solo si pertenece a ese usuario: pedir una ajena da 404 y no 403, para no confirmar que el id existe."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"es la orden pedida\", function () {",
+                  "    pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get(\"orderId\"));",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar ordenes del usuario",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-orders/v1/users/{{userId}}/orders",
+            "description": "Listado completo del usuario."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"contiene la orden creada\", function () {",
+                  "    const ids = pm.response.json().map(function (o) { return o.id; });",
+                  "    pm.expect(ids).to.include(pm.collectionVariables.get(\"orderId\"));",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Listar filtrando por estado",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-orders/v1/users/{{userId}}/orders?status=PENDING",
+            "description": "Estados posibles: PENDING, CONFIRMED, SHIPPED, DELIVERED y CANCELLED."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"todas vienen en el estado pedido\", function () {",
+                  "    pm.response.json().forEach(function (o) { pm.expect(o.status).to.eql(\"PENDING\"); });",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Estado",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{gatewayUrl}}/api-orders/v1/status",
+            "description": "Comprueba tres dependencias, y la tercera recorre la cadena completa orders -> tyk -> users.\n\nDevuelve siempre 200, tambien en degradado, porque lo consume la sonda del gateway. Por eso el codigo HTTP NO sirve para alertar: usa el atributo health.overall de la telemetria.\n\nPuede tardar decenas de segundos tras un despliegue: hace las tres comprobaciones en secuencia y una va contra httpbin.org."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"devuelve 200\", function () { pm.response.to.have.status(200); });",
+                  "",
+                  "// El campo se llama name aqui y service en users. Inconsistencia conocida",
+                  "// del PoC, documentada para que nadie la persiga.",
+                  "pm.response.json().services.forEach(function (s) {",
+                  "    pm.test(\"dependencia \" + s.name + \" en ok\", function () {",
+                  "        pm.expect(s.status).to.eql(\"ok\");",
+                  "    });",
+                  "});",
+                  "// Buena practica: capturar el trace id de la respuesta para poder saltar",
+                  "// de la peticion a su traza en New Relic sin buscarla a mano.",
+                  "// Los microservicios lo devuelven en X-Trace-Id desde RequestLoggingFilter",
+                  "// y Tyk reenvia la cabecera del upstream tal cual.",
+                  "const traceId = pm.response.headers.get(\"X-Trace-Id\");",
+                  "if (traceId) {",
+                  "    pm.collectionVariables.set(\"lastTraceId\", traceId);",
+                  "    console.log(\"trace.id = \" + traceId);",
+                  "    console.log(\"NRQL: SELECT * FROM Log WHERE trace.id = \" + JSON.stringify(traceId) + \" SINCE 30 minutes ago\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Administracion de Tyk",
+      "description": "API de administracion del gateway. Con tykSecret se puede crear cualquier credencial, asi que no compartas un entorno con ese valor dentro.\n\nEn un entorno real /tyk/... no deberia estar publicada en el ingress.",
+      "auth": {
+        "type": "noauth"
+      },
+      "item": [
+        {
+          "name": "Comprobar si existe una credencial",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-tyk-authorization",
+                "value": "{{tykSecret}}"
+              }
+            ],
+            "url": "{{gatewayUrl}}/tyk/keys/{{tykOrgId}}{{usersConsumerUser}}",
+            "description": "200 existe, 404 no existe.\n\nAQUI la clave va CON el prefijo de organizacion: Tyk indexa las claves de basic auth como org_id + usuario. Es lo que distingue \"la credencial no se creo\" de \"se creo con otra contrasena\", que son problemas distintos con el mismo 401."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"la credencial existe\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "if (pm.response.code === 404) {",
+                  "    console.log(\"La credencial NO existe: el aprovisionamiento la salto.\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear o refrescar credencial de api-users",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-tyk-authorization",
+                "value": "{{tykSecret}}"
+              }
+            ],
+            "url": "{{gatewayUrl}}/tyk/keys/{{usersConsumerUser}}",
+            "description": "Es un upsert, se puede repetir.\n\nAQUI el usuario va SIN el prefijo de organizacion: Tyk lo anade el mismo al indexar.\n\nEl api_id de access_rights DEBE coincidir con el de la definicion de API. Si no, Tyk autentica al usuario pero responde 403 con \"Access to this API has been disallowed\".\n\nCUIDADO con el cuerpo literal: una barra invertida hay que duplicarla, y los dos puntos no funcionan nunca porque Tyk parte la cabecera Basic por el primero.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"allowance\": 1000,\n  \"rate\": 1000,\n  \"per\": 60,\n  \"expires\": -1,\n  \"quota_max\": -1,\n  \"quota_remaining\": -1,\n  \"quota_renewal_rate\": 60,\n  \"org_id\": \"{{tykOrgId}}\",\n  \"access_rights\": {\n    \"api-users-001\": {\n      \"api_id\": \"api-users-001\",\n      \"api_name\": \"api-users-001\",\n      \"versions\": [\n        \"Default\"\n      ]\n    }\n  },\n  \"basic_auth_data\": {\n    \"password\": \"{{usersConsumerPassword}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"credencial escrita\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear o refrescar credencial de api-orders",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-tyk-authorization",
+                "value": "{{tykSecret}}"
+              }
+            ],
+            "url": "{{gatewayUrl}}/tyk/keys/{{ordersConsumerUser}}",
+            "description": "Igual que la anterior pero con el api_id de orders. El usuario TIENE que ser distinto del de users.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"allowance\": 1000,\n  \"rate\": 1000,\n  \"per\": 60,\n  \"expires\": -1,\n  \"quota_max\": -1,\n  \"quota_remaining\": -1,\n  \"quota_renewal_rate\": 60,\n  \"org_id\": \"{{tykOrgId}}\",\n  \"access_rights\": {\n    \"api-orders-001\": {\n      \"api_id\": \"api-orders-001\",\n      \"api_name\": \"api-orders-001\",\n      \"versions\": [\n        \"Default\"\n      ]\n    }\n  },\n  \"basic_auth_data\": {\n    \"password\": \"{{ordersConsumerPassword}}\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"credencial escrita\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "userId",
+      "value": "",
+      "type": "string",
+      "description": "Lo rellena el test de Crear usuario. No editar a mano."
+    },
+    {
+      "key": "orderId",
+      "value": "",
+      "type": "string",
+      "description": "Lo rellena el test de Crear orden. No editar a mano."
+    },
+    {
+      "key": "lastTraceId",
+      "value": "",
+      "type": "string",
+      "description": "Ultimo trace id recibido, para cruzarlo con New Relic."
+    }
+  ]
+}

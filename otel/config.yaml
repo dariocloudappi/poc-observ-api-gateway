@@ -47,9 +47,11 @@ connectors:
     dimensions:
       - name: http.method
       - name: http.status_code
-      # http.route only if the APIs do not use dynamic path params.
-      - name: http.route
       - name: tyk.api.name
+      # Ruta agrupada, la construye transform/normalize_route. Sustituye a
+      # http.route, que estaba declarada aqui y NUNCA llegaba porque Tyk 5.12 no
+      # la produce: cualquier consulta con FACET http.route salia vacia.
+      - name: tyk.route
     # Prefix of the generated metric names: tyk.gateway.calls and
     # tyk.gateway.duration. Dots because that is the OTel convention for metric
     # names, while the service.name of the gateway is tyk-gateway. Same words in
@@ -170,14 +172,64 @@ processors:
         value: "${env:SERVICE_VERSION}"
         action: upsert
 
+
   filter/drop_health_traces:
     error_mode: ignore
     traces:
       span:
-        - 'attributes["http.route"] == "/health"'
-        - 'attributes["http.route"] == "/healthz"'
-        - 'attributes["http.route"] == "/hello"'
+        - 'attributes["http.target"] == "/health"'
+        - 'attributes["http.target"] == "/healthz"'
+        - 'attributes["http.target"] == "/hello"'
         - 'IsMatch(attributes["http.url"], ".*/health.*")'
+
+  # Ruta normalizada, para poder desglosar por recurso sin reventar la
+  # cardinalidad.
+  #
+  # EL PROBLEMA: para agrupar por recurso hacen falta dos cosas a la vez, ruta
+  # identificable y cardinalidad acotada, y Tyk no ofrece ninguna dimension que
+  # tenga las dos:
+  #
+  #   http.route    no existe. Tyk 5.12 no lo produce (medido).
+  #   http.target   existe, pero es la ruta CRUDA: /users/<uuid>/orders/<uuid>.
+  #                 Una serie temporal por identificador, cardinalidad infinita.
+  #   span.name     igual de crudo ("GET /users/<uuid>"), y spanmetrics lo anade
+  #                 siempre, no es configurable.
+  #   tyk.api.path  el listen path, /api-users/v1. Acotado, pero es la misma
+  #                 granularidad que tyk.api.name: no distingue recursos.
+  #
+  # LA SOLUCION: construir la ruta agrupada aqui, sustituyendo los
+  # identificadores por {id} antes de que spanmetrics genere las metricas.
+  # /users/3fa85f64-.../orders/7c9e6679-... pasa a /users/{id}/orders/{id}, que
+  # es UNA serie temporal por recurso real.
+  #
+  # Va en el pipeline de traces por delante de spanmetrics: el conector es un
+  # exporter de ese pipeline, asi que ve los spans ya transformados.
+  #
+  # Sin barras invertidas a proposito: OTTL las rechaza dentro de sus cadenas.
+  # De ahi [?] en vez de la version escapada.
+  transform/normalize_route:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["tyk.route"], attributes["http.target"])
+            where attributes["http.target"] != nil
+
+          # La query string fuera: ?page=2&size=10 tambien multiplica series.
+          - replace_pattern(attributes["tyk.route"], "[?].*", "")
+            where attributes["tyk.route"] != nil
+
+          # uuid, que es lo que usan los dos microservicios como id.
+          - >-
+            replace_pattern(attributes["tyk.route"],
+            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            "{id}")
+            where attributes["tyk.route"] != nil
+
+          # Ids numericos. El patron exige la barra delante justamente para no
+          # destrozar /v1, que tambien lleva un digito.
+          - replace_pattern(attributes["tyk.route"], "/[0-9]+", "/{id}")
+            where attributes["tyk.route"] != nil
 
   transform/parse_tyk:
     error_mode: ignore
@@ -490,6 +542,9 @@ service:
         - memory_limiter
         - filter/drop_health_traces
         - resource
+        # Por delante de spanmetrics a proposito, ver el comentario del
+        # procesador: si fuese despues, la metrica no tendria tyk.route.
+        - transform/normalize_route
         - transform/remove_sensitive
         - redaction
         - batch/traces

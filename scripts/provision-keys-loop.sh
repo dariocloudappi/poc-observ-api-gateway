@@ -241,6 +241,26 @@ process_api() {
   fi
 }
 
+# Los usuarios de las dos APIs DEBEN ser distintos.
+#
+# MOTIVO, reproducido contra el gateway: Tyk indexa las claves de basic auth
+# como org_id + usuario. Con el mismo usuario, la segunda escritura pisa la
+# primera y en Redis queda UNA sola clave, con el access_rights y la contrasena
+# de la segunda API. Los dos POST devuelven 200 y nada avisa. La API que se
+# escribe primero empieza a devolver 401 con
+#   "Attempted access with existing user, failed password check."
+#
+# Se comprueba una vez, antes del bucle, y el contenedor se queda dormido en
+# lugar de salir: un exit haria que Container Apps lo reiniciase sin parar y el
+# error se perderia entre reinicios.
+if [ -n "${USERNAME_API_USERS:-}" ] && [ "${USERNAME_API_USERS:-}" = "${USERNAME_API_ORDERS:-}" ]; then
+  log "ERROR USERNAME_API_USERS y USERNAME_API_ORDERS son IGUALES."
+  log "      Tyk indexa las claves como org_id + usuario, asi que una pisaria a la"
+  log "      otra y una de las dos APIs devolveria 401 con \"failed password check\"."
+  log "      Usa un usuario distinto para cada API. No se aprovisiona nada."
+  while true; do sleep 3600; done
+fi
+
 while true; do
   # El "|| true" es imprescindible: con set -e, un process_api que devuelve 1
   # (credencial invalida) abortaria el script y la SEGUNDA API se quedaria sin

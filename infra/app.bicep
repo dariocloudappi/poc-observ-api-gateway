@@ -107,10 +107,14 @@ param environmentName string = 'poc'
 param serviceVersion string = 'unknown'
 param serviceNamespace string = 'poc-observability'
 
-// Los upstreams (url, usuario, contrasena) y tykOrgId / tykDetailedTracing YA NO
-// son parametros de la plantilla: los consume scripts/render-apis.sh en el
+// Los upstreams (url, usuario, contrasena) y tykDetailedTracing YA NO son
+// parametros de la plantilla: los consume scripts/render-apis.sh en el
 // pipeline, que produce las definiciones de API ya resueltas. La plantilla solo
 // recibe el resultado, como secreto.
+//
+// tykOrgId SI vuelve a ser parametro, mas abajo: lo necesita el sidecar que
+// mantiene las credenciales, porque Tyk indexa las claves de basic auth como
+// org_id + usuario.
 // Nivel de log de Tyk, gateway y pump. En debug: es una PoC de formacion y lo
 // que se busca es ver el detalle de cada salto, incluido el middleware que
 // rechaza una peticion.
@@ -130,6 +134,29 @@ param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_g
 // diagnostiques por que no llega algo, con la variable de repositorio
 // OTEL_TELEMETRY_LOG_LEVEL.
 param otelTelemetryLogLevel string = 'info'
+
+@description('Imagen del sidecar que mantiene las credenciales de consumidor en Redis')
+param provisionerImage string
+
+@description('Organizacion de Tyk. DEBE coincidir con el org_id de las definiciones de API renderizadas: Tyk indexa las claves de basic auth como org_id + usuario, asi que un valor distinto crea la clave donde nadie la busca')
+param tykOrgId string = 'poc-organization'
+
+@description('Usuario consumidor de api-users. Vacio = no se mantiene ninguna credencial para esa API')
+param consumerUserApiUsers string = ''
+
+@secure()
+param consumerPasswordApiUsers string = ''
+
+@description('Usuario consumidor de api-orders')
+param consumerUserApiOrders string = ''
+
+@secure()
+param consumerPasswordApiOrders string = ''
+
+@description('Segundos entre reescrituras de las credenciales. 300 basta: solo tiene que cubrir el arranque de una replica nueva')
+@minValue(30)
+@maxValue(3600)
+param provisionCheckInterval int = 300
 
 @description('Master switch for the observability sidecars. When false the pump and the collector are not deployed and the gateway stops emitting telemetry')
 param observabilityEnabled bool = true
@@ -465,6 +492,71 @@ var baseContainers = [
       }
     ]
   }
+  // ---------------------------------------------------------------------------
+  // Mantenedor de las credenciales de consumidor
+  // ---------------------------------------------------------------------------
+  // Las credenciales de Basic Auth de Tyk viven SOLO en Redis, y Redis es un
+  // sidecar sin persistencia. Cada replica nueva arranca con Redis vacio y a
+  // partir de ese momento todo consumidor recibe:
+  //
+  //   401 {"error": "User not authorised"}
+  //
+  // El aprovisionamiento de la pipeline solo corre durante un despliegue, asi
+  // que no cubre los reinicios posteriores: un cambio de revision, un OOM o una
+  // reprogramacion de la plataforma dejaban el gateway rechazando a todo el
+  // mundo sin que nada lo detectase.
+  //
+  // Este contenedor arranca con la replica, espera a que el gateway responda en
+  // /hello y reescribe las credenciales. Verificado en local destruyendo Tyk y
+  // Redis a la vez: la autenticacion se recupera sola en un ciclo.
+  //
+  // Va en baseContainers y no en observabilityContainers a proposito: sin
+  // credenciales el gateway no sirve, asi que no debe depender de que la
+  // observabilidad este activada.
+  {
+    name: 'key-provisioner'
+    image: provisionerImage
+    resources: {
+      cpu: json('0.25')
+      memory: '0.5Gi'
+    }
+    env: [
+      {
+        name: 'TYK_SECRET'
+        secretRef: 'tyk-secret'
+      }
+      {
+        name: 'TYK_ORG_ID'
+        value: tykOrgId
+      }
+      {
+        // localhost: los contenedores de una replica comparten el namespace de
+        // red, asi que no pasa por el ingress ni por TLS.
+        name: 'GATEWAY_INTERNAL_URL'
+        value: 'http://localhost:${gatewayPort}'
+      }
+      {
+        name: 'PROVISION_CHECK_INTERVAL'
+        value: string(provisionCheckInterval)
+      }
+      {
+        name: 'USERNAME_API_USERS'
+        value: consumerUserApiUsers
+      }
+      {
+        name: 'PASSWORD_API_USERS'
+        secretRef: 'consumer-password-api-users'
+      }
+      {
+        name: 'USERNAME_API_ORDERS'
+        value: consumerUserApiOrders
+      }
+      {
+        name: 'PASSWORD_API_ORDERS'
+        secretRef: 'consumer-password-api-orders'
+      }
+    ]
+  }
 ]
 
 // =============================================================================
@@ -521,6 +613,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'newrelic-license-key'
           value: newRelicLicenseKey
+        }
+        // Credenciales de CONSUMIDOR del gateway. Llegan al contenedor porque
+        // el sidecar las reescribe en Redis en cada arranque de replica; el
+        // gateway en si no las usa. Se guarda un espacio y no una cadena vacia:
+        // Container Apps rechaza un secreto con valor vacio.
+        {
+          name: 'consumer-password-api-users'
+          value: empty(consumerPasswordApiUsers) ? ' ' : consumerPasswordApiUsers
+        }
+        {
+          name: 'consumer-password-api-orders'
+          value: empty(consumerPasswordApiOrders) ? ' ' : consumerPasswordApiOrders
         }
         {
           name: 'api-definition-users'

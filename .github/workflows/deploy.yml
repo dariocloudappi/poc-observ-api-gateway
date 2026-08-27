@@ -54,6 +54,8 @@ env:
   TYK_VERSION: ${{ vars.TYK_VERSION || 'v5.12.0' }}
   TYK_PUMP_VERSION: ${{ vars.TYK_PUMP_VERSION || 'v1.12.0' }}
   OTEL_VERSION: ${{ vars.OTEL_VERSION || '0.100.0' }}
+  # Imagen del sidecar que mantiene las credenciales de consumidor.
+  CURL_VERSION: ${{ vars.CURL_VERSION || '8.8.0' }}
   # Un span por middleware de Tyk. Muy util para ver por donde se va el
   # tiempo dentro del gateway, pero multiplica el volumen de spans. Estaba
   # fijado a true en el Bicep y no se podia apagar sin editarlo.
@@ -240,13 +242,24 @@ jobs:
             --build-arg "OTEL_VERSION=${OTEL_VERSION}" \
             --tag "${ACR}/otel-collector:${TAG}" .
 
+          # Sidecar que reescribe las credenciales de consumidor en Redis
+          # en cada arranque de replica. Sin el, un reinicio deja el gateway
+          # devolviendo 401 a todo el mundo: las credenciales de Tyk viven
+          # solo en Redis y Redis aqui no tiene persistencia.
+          docker build \
+            --file docker/provisioner.Dockerfile \
+            --build-arg "CURL_VERSION=${CURL_VERSION}" \
+            --tag "${ACR}/key-provisioner:${TAG}" .
+
           docker push "${ACR}/tyk-gateway:${TAG}"
           docker push "${ACR}/tyk-pump:${TAG}"
           docker push "${ACR}/otel-collector:${TAG}"
+          docker push "${ACR}/key-provisioner:${TAG}"
 
           echo "gateway=${ACR}/tyk-gateway:${TAG}" >> "$GITHUB_OUTPUT"
           echo "pump=${ACR}/tyk-pump:${TAG}" >> "$GITHUB_OUTPUT"
           echo "otel=${ACR}/otel-collector:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "provisioner=${ACR}/key-provisioner:${TAG}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------
       # Definiciones de API
@@ -303,6 +316,14 @@ jobs:
           IMAGE_GATEWAY: ${{ steps.images.outputs.gateway }}
           IMAGE_PUMP: ${{ steps.images.outputs.pump }}
           IMAGE_OTEL: ${{ steps.images.outputs.otel }}
+          IMAGE_PROVISIONER: ${{ steps.images.outputs.provisioner }}
+          TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
+          # Credenciales de consumidor: las consume el sidecar dentro de la
+          # replica para reescribirlas en Redis tras cada reinicio.
+          USERNAME_API_USERS: ${{ secrets.USERNAME_API_USERS }}
+          PASSWORD_API_USERS: ${{ secrets.PASSWORD_API_USERS }}
+          USERNAME_API_ORDERS: ${{ secrets.USERNAME_API_ORDERS }}
+          PASSWORD_API_ORDERS: ${{ secrets.PASSWORD_API_ORDERS }}
           OBSERVABILITY_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.observability_enabled || 'true' }}
           TYK_ENABLE_DETAILED_RECORDING: ${{ vars.TYK_ENABLE_DETAILED_RECORDING || 'false' }}
           TYK_LOG_LEVEL: ${{ vars.TYK_LOG_LEVEL || 'debug' }}
@@ -320,7 +341,7 @@ jobs:
           # value would reach the template silently. Fail here with a clear
           # message instead.
           for name in AZURE_CAE_NAME AZURE_IDENTITY_ID AZURE_ACR_LOGIN_SERVER \
-                      IMAGE_GATEWAY IMAGE_PUMP IMAGE_OTEL \
+                      IMAGE_GATEWAY IMAGE_PUMP IMAGE_OTEL IMAGE_PROVISIONER \
                       API_DEFINITION_USERS_B64 API_DEFINITION_ORDERS_B64; do
             if [ -z "${!name:-}" ]; then
               echo "ERROR: ${name} is empty. The foundation stage did not return it." >&2
@@ -411,13 +432,137 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${USERNAME_API_USERS}" ] && [ -z "${USERNAME_API_ORDERS}" ]; then
-            echo "No consumer credentials configured, skipping key provisioning."
-            exit 0
+            {
+              echo "### Faltan los secrets de las credenciales de consumidor"
+              echo
+              echo "Configura en Settings -> Secrets and variables -> Actions:"
+              echo
+              echo "| Secret | Para |"
+              echo "| --- | --- |"
+              echo "| USERNAME_API_USERS / PASSWORD_API_USERS | consumir api-users |"
+              echo "| USERNAME_API_ORDERS / PASSWORD_API_ORDERS | consumir api-orders |"
+              echo
+              echo "Son SECRETS del repositorio, no variables, y no llegan al"
+              echo "contenedor: solo los usa provision_key.sh contra la API de"
+              echo "administracion de Tyk para crear la credencial en Redis."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "ERROR: no hay credenciales de consumidor configuradas." >&2
+            echo "Las APIs usan use_basic_auth, asi que sin credenciales el gateway" >&2
+            echo "rechaza toda peticion con 401. Ver el resumen del despliegue." >&2
+            exit 1
           fi
+
+          # Un solo par configurado es valido, pero conviene avisar: la otra API
+          # quedara inaccesible y el sintoma sera un 401 dificil de atribuir.
+          for pair in "USERNAME_API_USERS:api-users" "USERNAME_API_ORDERS:api-orders"; do
+            var="${pair%%:*}"
+            api="${pair##*:}"
+            if [ -z "${!var}" ]; then
+              echo "AVISO: ${var} no esta configurado. ${api} quedara sin credenciales y devolvera 401."
+            fi
+          done
           echo "::add-mask::${PASSWORD_API_USERS}"
           echo "::add-mask::${PASSWORD_API_ORDERS}"
           chmod +x ./provision_key.sh
           ./provision_key.sh
+
+      # ---------------------------------------------------------------------
+      # Stage 6: la credencial funciona de verdad
+      # ---------------------------------------------------------------------
+      # Sin este paso el fallo era SILENCIOSO. El despliegue salia verde y el
+      # consumidor recibia 401 {"error": "User not authorised"}, que Tyk emite
+      # tanto si el usuario no existe en Redis como si la contrasena no
+      # coincide. Nada en la pipeline lo detectaba.
+      #
+      # Se comprueban las dos direcciones, porque una sola no prueba nada:
+      #
+      #   credencial correcta   -> NO debe ser 401 ni 403
+      #   credencial incorrecta -> SI debe ser 401
+      #
+      # Sin la segunda, una API mal configurada como keyless pasaria la primera
+      # comprobacion sin autenticar a nadie.
+      #
+      # Un 502, 503 o 404 con la credencial correcta se ACEPTA: significa que
+      # la autenticacion paso y el fallo esta en el upstream, que es otro
+      # problema y tiene sus propias comprobaciones.
+      - name: Verify the consumer credentials against the gateway
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.provision_keys == 'true' }}
+        env:
+          URL: ${{ steps.app.outputs.url }}
+          USERNAME_API_USERS: ${{ secrets.USERNAME_API_USERS }}
+          PASSWORD_API_USERS: ${{ secrets.PASSWORD_API_USERS }}
+          USERNAME_API_ORDERS: ${{ secrets.USERNAME_API_ORDERS }}
+          PASSWORD_API_ORDERS: ${{ secrets.PASSWORD_API_ORDERS }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${PASSWORD_API_USERS}"
+          echo "::add-mask::${PASSWORD_API_ORDERS}"
+
+          failed=0
+
+          check() {
+            local label="$1" path="$2" user="$3" pass="$4"
+
+            if [ -z "$user" ] || [ -z "$pass" ]; then
+              echo "  ${label}: sin credenciales configuradas, se omite"
+              return 0
+            fi
+
+            # --- 1) la credencial correcta NO debe dar 401 ni 403 ---
+            local ok_code
+            ok_code=$(curl --silent --output /dev/null --write-out '%{http_code}'               --max-time 30 --user "${user}:${pass}" "${URL}${path}")
+
+            if [ "$ok_code" = "401" ] || [ "$ok_code" = "403" ]; then
+              echo "  ${label}: FALLO -> ${path} devolvio ${ok_code} con la credencial correcta"
+              failed=1
+            else
+              echo "  ${label}: OK -> ${path} devolvio ${ok_code} (autenticacion superada)"
+            fi
+
+            # --- 2) una credencial incorrecta SI debe dar 401 ---
+            local bad_code
+            bad_code=$(curl --silent --output /dev/null --write-out '%{http_code}'               --max-time 30 --user "${user}:credencial-invalida-de-prueba" "${URL}${path}")
+
+            if [ "$bad_code" != "401" ]; then
+              echo "  ${label}: FALLO -> con contrasena incorrecta devolvio ${bad_code}, se esperaba 401"
+              echo "           la API podria estar sin autenticacion (use_keyless)"
+              failed=1
+            else
+              echo "  ${label}: OK -> contrasena incorrecta rechazada con 401"
+            fi
+          }
+
+          echo "Comprobando que el gateway acepta las credenciales aprovisionadas:"
+          check "api-users"  "/api-users/v1/users"  "$USERNAME_API_USERS"  "$PASSWORD_API_USERS"
+          check "api-orders" "/api-orders/v1"      "$USERNAME_API_ORDERS" "$PASSWORD_API_ORDERS"
+
+          if [ "$failed" != "0" ]; then
+            {
+              echo "### Las credenciales de consumidor NO funcionan"
+              echo
+              echo "El gateway devuelve 401 con la credencial aprovisionada."
+              echo
+              echo "Causas por orden de probabilidad:"
+              echo
+              echo "1. Los secrets USERNAME_API_* / PASSWORD_API_* no estaban configurados"
+              echo "   cuando corrio el aprovisionamiento. Anadirlos NO aprovisiona nada"
+              echo "   retroactivamente: hay que volver a lanzar la pipeline."
+              echo "2. La replica del container app se ha reiniciado despues del"
+              echo "   aprovisionamiento. Redis es un sidecar SIN persistencia, asi que"
+              echo "   una replica nueva arranca vacia y pierde todas las credenciales."
+              echo "3. La contrasena del secret no coincide con la que se aprovisiono."
+              echo
+              echo "Para reaprovisionar sin commit: Actions -> Run workflow con"
+              echo "provision_keys en true."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "ERROR: el gateway no acepta las credenciales de consumidor." >&2
+            echo "Ver el resumen del despliegue para las causas probables." >&2
+            exit 1
+          fi
+
+          echo "Las credenciales de consumidor funcionan contra el gateway."
 
       - name: Deployment summary
         if: always()

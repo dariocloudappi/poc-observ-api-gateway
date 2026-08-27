@@ -55,3 +55,11 @@ param tykLogLevel = readEnvironmentVariable('TYK_LOG_LEVEL', 'debug')
 // siempre en el default de la plantilla y no habia forma de subirlo sin
 // editar el bicep.
 param otelTelemetryLogLevel = readEnvironmentVariable('OTEL_TELEMETRY_LOG_LEVEL', 'info')
+
+// Sidecar que mantiene las credenciales de consumidor en Redis.
+param provisionerImage = readEnvironmentVariable('IMAGE_PROVISIONER', '')
+param tykOrgId = readEnvironmentVariable('TYK_ORG_ID', 'poc-organization')
+param consumerUserApiUsers = readEnvironmentVariable('USERNAME_API_USERS', '')
+param consumerPasswordApiUsers = readEnvironmentVariable('PASSWORD_API_USERS', '')
+param consumerUserApiOrders = readEnvironmentVariable('USERNAME_API_ORDERS', '')
+param consumerPasswordApiOrders = readEnvironmentVariable('PASSWORD_API_ORDERS', '')

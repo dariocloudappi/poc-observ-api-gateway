@@ -10,6 +10,9 @@
 #   TYK_PUMP_METRICS_ENDPOINT host:port of the Tyk Pump prometheus pump
 #   OTEL_TELEMETRY_LOG_LEVEL  collector self-telemetry log level
 #
+# Muestreo de trazas: se decide aqui, no en los SDK. Ver el procesador
+# tail_sampling y la division del pipeline de trazas al final del fichero.
+#
 # Entrada de logs por dos receptores, ambos siempre activos:
 #   - fluentforward (24224): entorno local, mediante el driver de logging
 #     fluentd de docker compose.
@@ -121,10 +124,14 @@ receivers:
 
 processors:
 
+  # El limite sube de 400 a 1024 MiB por tail_sampling: ese procesador retiene
+  # en memoria toda traza en curso durante decision_wait, de modo que el consumo
+  # deja de depender solo del tamano del lote y pasa a depender del caudal de
+  # trazas. Con num_traces 50000 el pico esperado ronda los 500 MiB.
   memory_limiter:
     check_interval: 1s
-    limit_mib: 400
-    spike_limit_mib: 100
+    limit_mib: 1024
+    spike_limit_mib: 256
 
   # Batching is tuned per signal: logs need lower latency than metrics.
   batch/traces:
@@ -158,6 +165,73 @@ processors:
         value: "${env:SERVICE_VERSION}"
         action: upsert
 
+
+  # -------------------------------------------------------------------------
+  # Muestreo por cola
+  # -------------------------------------------------------------------------
+  # Decide sobre la traza YA COMPLETA, que es lo que permite conservar el 100%
+  # de lo que falla o va lento y quedarse con una fraccion de lo exitoso. Un
+  # sampler de cabecera en el SDK no puede hacerlo: cuando se abre el span raiz
+  # en el gateway todavia no se conoce el codigo de respuesta.
+  #
+  # Requisito: todos los spans de un mismo trace_id deben llegar a ESTA
+  # instancia de colector. Se cumple mientras el container app corra con una
+  # sola replica (infra/app.bicep fija minReplicas = maxReplicas = 1) y todos
+  # los servicios exporten aqui en lugar de directamente a New Relic. Con
+  # varias replicas hacen falta dos capas: colectores agente que exporten con
+  # el exportador loadbalancing y routing_key traceID hacia un pool de
+  # colectores que lleven este procesador.
+  #
+  # Los SDK NO deben muestrear: mantienen parentbased_always_on para que la
+  # traza llegue entera y sea juzgable.
+  # -------------------------------------------------------------------------
+  tail_sampling:
+    # Cuanto se espera desde el primer span antes de decidir. Debe superar la
+    # duracion total de la traza mas la retencion de los exportadores de
+    # origen: el agente Java retiene hasta 5s en su BatchSpanProcessor. Si se
+    # queda corto se decide sobre trazas incompletas, y eso se ve en la metrica
+    # otelcol_processor_tail_sampling_sampling_trace_dropped_too_early.
+    decision_wait: 30s
+    num_traces: 50000
+    expected_new_traces_per_sec: 200
+
+    # Las politicas se evaluan en OR: basta que una diga muestrear para que la
+    # traza se conserve entera. De ahi que la fraccion de exitosas se exprese
+    # como un and, y no como una politica suelta.
+    policies:
+
+      - name: errores-de-span
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      # Tyk marca el span como OK aunque el upstream responda 5xx, de modo que
+      # status_code por si solo dejaria escapar los fallos del gateway.
+      - name: errores-http
+        type: numeric_attribute
+        numeric_attribute:
+          key: http.status_code
+          min_value: 400
+          max_value: 599
+
+      - name: trazas-lentas
+        type: latency
+        latency:
+          threshold_ms: 1500
+
+      # Todo lo demas, exitoso y rapido: una de cada veinte.
+      - name: exitosas-muestreadas
+        type: and
+        and:
+          and_sub_policy:
+            - name: sin-error
+              type: status_code
+              status_code:
+                status_codes: [OK, UNSET]
+            - name: cinco-por-ciento
+              type: probabilistic
+              probabilistic:
+                sampling_percentage: 5
 
   filter/drop_health_traces:
     error_mode: ignore
@@ -514,7 +588,25 @@ service:
 
   pipelines:
 
-    traces:
+    # -------------------------------------------------------------------------
+    # Dos pipelines de trazas sobre el mismo receptor
+    # -------------------------------------------------------------------------
+    # Un receptor puede alimentar varios pipelines: cada uno recibe su copia de
+    # los datos y los procesadores de uno no afectan al otro.
+    #
+    # La division existe por el orden entre spanmetrics y el muestreo. Con un
+    # unico pipeline, spanmetrics es un exportador y por tanto veria lo que
+    # sobrevive a tail_sampling: la tasa de error se calcularia sobre el 100% de
+    # las trazas fallidas y el 5% de las exitosas, y los cuadros de mando
+    # dirian que casi todo falla. Los percentiles quedarian igual de sesgados.
+    #
+    # Separados, las metricas RED siguen siendo exactas mientras el volumen de
+    # spans enviado a New Relic cae en torno al 95%. Eso permite retencion
+    # larga sobre las metricas y corta sobre las trazas.
+    # -------------------------------------------------------------------------
+
+    # El 100% de los spans, sin muestrear.
+    traces/spanmetrics:
       receivers: [otlp]
       processors:
         - memory_limiter
@@ -523,10 +615,23 @@ service:
         # Debe preceder a spanmetrics: en otro orden la metrica no llevaria
         # tyk.route.
         - transform/normalize_route
+      exporters: [spanmetrics]
+
+    # Solo las trazas que sobreviven al muestreo.
+    traces/newrelic:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - filter/drop_health_traces
+        - resource
+        - transform/normalize_route
         - transform/remove_sensitive
         - redaction
+        # Antes de batch/traces: tail_sampling libera la traza entera de golpe
+        # cuando decide, y el lote agrupa despues lo que ha sobrevivido.
+        - tail_sampling
         - batch/traces
-      exporters: [otlphttp/newrelic, spanmetrics, debug]
+      exporters: [otlphttp/newrelic, debug]
 
     # Un pipeline por origen, para poder nombrar cada componente. Un procesador
     # no distingue de que receptor procede una metrica, de modo que un pipeline

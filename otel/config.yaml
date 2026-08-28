@@ -29,6 +29,29 @@
 # =============================================================================
 
 connectors:
+
+  # -------------------------------------------------------------------------
+  # Bifurcacion de los logs
+  # -------------------------------------------------------------------------
+  # La decision de tail_sampling NO puede gobernar los logs: se toma 30s
+  # despues, en otro pipeline, y el procesador no la expone a nadie. Muestrear
+  # logs "al mismo porcentaje" no da coherencia, da dos sorteos independientes:
+  # medido con ambos al 50% sobre los mismos trace_id, solo el 35% de las
+  # trazas conservadas mantenia su log.
+  #
+  # De modo que los logs se recortan por SEVERIDAD, no por traza. Se conserva
+  # entero todo lo que se mira cuando algo falla y se muestrea el registro
+  # rutinario, que es el que crece con el trafico.
+  #
+  # forward es un reenvio sin logica: entrega una copia integra a cada pipeline
+  # que lo consuma, y es cada uno quien se queda con su mitad mediante
+  # filter/solo_*. Se usa este y no el conector routing porque routing en la
+  # 0.100.0 solo evalua OTTL en contexto de resource, donde severity_number no
+  # existe. La otra alternativa, dos pipelines de entrada completos, pagaria dos
+  # veces el parseo de transform/parse_tyk.
+  # -------------------------------------------------------------------------
+  forward/logs: {}
+
   spanmetrics:
     histogram:
       exponential:
@@ -149,22 +172,83 @@ processors:
     send_batch_size: 256
     send_batch_max_size: 512
 
+  # insert y no upsert en los tres primeros: por este colector ya no pasa solo
+  # el gateway, sino tambien orders y users, que declaran sus propios valores en
+  # OTEL_RESOURCE_ATTRIBUTES. Con upsert, SERVICE_VERSION, que es la version de
+  # TYK, sobrescribiria la de cada microservicio, y ENVIRONMENT reetiquetaria su
+  # telemetria con el entorno del gateway. insert respeta lo que ya viene puesto
+  # y rellena solo lo que falta, que es el caso de Tyk.
   resource:
     attributes:
       - key: deployment.environment
         value: "${env:ENVIRONMENT}"
-        action: upsert
+        action: insert
       - key: service.namespace
         value: "${env:SERVICE_NAMESPACE}"
-        action: upsert
+        action: insert
       - key: cloud.provider
         value: azure
         action: insert
       # Version de Tyk, para identificar el gateway que produjo la telemetria.
       - key: service.version
         value: "${env:SERVICE_VERSION}"
-        action: upsert
+        action: insert
 
+
+  # Las dos mitades de la bifurcacion. La condicion es la misma, negada, de modo
+  # que lo que un filtro descarta es exactamente lo que el otro conserva: ningun
+  # registro se pierde ni se duplica.
+  #
+  #   severity_number entre 1 y 9   TRACE, DEBUG e INFO. WARN (13) y superiores
+  #                                 quedan fuera, y tambien el 0 de severidad
+  #                                 sin asignar: ante la duda, se conserva.
+  #
+  #   attributes["trace.id"] != nil un registro por peticion. Es ademas
+  #                                 obligatorio: probabilistic_sampler descarta
+  #                                 en bloque los registros sin el atributo del
+  #                                 que muestrea, comprobado con 40 de 40. Sin
+  #                                 esta condicion desapareceria todo INFO de
+  #                                 arranque y de carga de APIs.
+  #
+  # El procesador filter DESCARTA lo que casa con su condicion.
+  filter/solo_relevantes:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'severity_number > 0 and severity_number <= 9 and attributes["trace.id"] != nil'
+
+  filter/solo_rutinarios:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'not (severity_number > 0 and severity_number <= 9 and attributes["trace.id"] != nil)'
+
+  # Muestreo de los logs rutinarios. El porcentaje es deliberadamente distinto
+  # del de tail_sampling: igualarlos sugeriria una correspondencia entre ambas
+  # senales que no existe. Aqui se muestrea el registro por si mismo, no la
+  # traza a la que pertenece.
+  #
+  # attribute_source record en lugar de traceID: los logs de Tyk llegan por
+  # fluentforward y udplog como JSON, de modo que su identificador de traza
+  # queda en un atributo y no en el campo TraceID del registro. trace.id lo
+  # normalizan transform/parse_tyk para Tyk y transform/normalize_trace_id para
+  # los que entran por OTLP.
+  probabilistic_sampler/logs_rutinarios:
+    sampling_percentage: 10
+    hash_seed: 22
+    attribute_source: record
+    from_attribute: trace.id
+
+  # Los registros que entran por OTLP llevan la traza en el campo TraceID del
+  # propio registro, no como atributo. Se copia a trace.id para que
+  # los filtros y el muestreador puedan leerla igual que la de Tyk.
+  transform/normalize_trace_id:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["trace.id"], trace_id.string)
+            where trace_id.string != "00000000000000000000000000000000"
 
   # -------------------------------------------------------------------------
   # Muestreo por cola
@@ -674,7 +758,37 @@ service:
         - batch/metrics
       exporters: [otlphttp/newrelic, debug]
 
-    logs:
+    # Metricas de orders y users. OTEL_EXPORTER_OTLP_ENDPOINT gobierna las tres
+    # senales a la vez, de modo que al apuntar los microservicios a este
+    # colector para poder muestrear sus trazas, sus metricas y sus logs pasan a
+    # entrar tambien por el receptor otlp. Sin este pipeline y sin logs/otlp se
+    # descartarian en silencio: un receptor que ningun pipeline consume no da
+    # error, simplemente no lleva sus datos a ninguna parte.
+    #
+    # Sin resource/<algo>: cada microservicio ya declara su service.name en
+    # OTEL_RESOURCE_ATTRIBUTES, y resource solo rellena lo que falte.
+    metrics/otlp:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - resource
+        - batch/metrics
+      exporters: [otlphttp/newrelic, debug]
+
+    # -------------------------------------------------------------------------
+    # Cuatro pipelines de logs: dos de entrada y dos de salida
+    # -------------------------------------------------------------------------
+    # Los de entrada estan separados por origen porque no admiten el mismo
+    # tratamiento: transform/parse_tyk asigna service.name = tyk-gateway a todo
+    # registro que no lo traiga como ATRIBUTO, y los que llegan por OTLP lo
+    # traen como atributo de RESOURCE. Compartir pipeline etiquetaria como
+    # gateway todos los logs de orders y de users.
+    #
+    # Los dos convergen en forward/logs, que entrega una copia a cada pipeline de
+    # salida. Ahi es donde cada uno se queda con su mitad y se muestrea.
+    # -------------------------------------------------------------------------
+
+    logs/tyk:
       receivers: [fluentforward, udplog/tyk, filelog/sidecars]
       processors:
         - memory_limiter
@@ -687,6 +801,35 @@ service:
         - transform/remove_sensitive
         - resource
         - resource/logs
+      exporters: [forward/logs]
+
+    # Logs de orders y users, por el receptor otlp.
+    logs/otlp:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/normalize_trace_id
+        - transform/remove_sensitive
+        - resource
+      exporters: [forward/logs]
+
+    # WARN, ERROR, severidad sin asignar y todo INFO sin contexto de traza:
+    # integro, sin muestrear.
+    logs/relevantes:
+      receivers: [forward/logs]
+      processors:
+        - memory_limiter
+        - filter/solo_relevantes
+        - batch/logs
+      exporters: [otlphttp/newrelic, debug]
+
+    # Registro rutinario por peticion: muestreado.
+    logs/rutinarios:
+      receivers: [forward/logs]
+      processors:
+        - memory_limiter
+        - filter/solo_rutinarios
+        - probabilistic_sampler/logs_rutinarios
         - batch/logs
       exporters: [otlphttp/newrelic, debug]
 

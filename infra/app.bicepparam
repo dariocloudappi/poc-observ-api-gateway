@@ -50,7 +50,7 @@ param serviceNamespace = readEnvironmentVariable('SERVICE_NAMESPACE', 'poc-obser
 param applyLogExclusionTag = bool(readEnvironmentVariable('NR_EXCLUDE_PLATFORM_LOGS', 'false'))
 param observabilityEnabled = bool(readEnvironmentVariable('OBSERVABILITY_ENABLED', 'true'))
 param tykEnableDetailedRecording = readEnvironmentVariable('TYK_ENABLE_DETAILED_RECORDING', 'false')
-param tykLogLevel = readEnvironmentVariable('TYK_LOG_LEVEL', 'debug')
+param tykLogLevel = readEnvironmentVariable('TYK_LOG_LEVEL', 'info')
 // Antes no se leia del entorno, asi que el nivel del colector se quedaba
 // siempre en el default de la plantilla y no habia forma de subirlo sin
 // editar el bicep.

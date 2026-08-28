@@ -94,7 +94,7 @@ services:
       TYK_GW_ANALYTICSCONFIG_ENABLEDETAILEDRECORDING: ${TYK_ENABLE_DETAILED_RECORDING:-false}
 
       # Logging
-      TYK_GW_LOGLEVEL: ${TYK_LOG_LEVEL:-debug}
+      TYK_GW_LOGLEVEL: ${TYK_LOG_LEVEL:-info}
       TYK_GW_LOGFORMAT: ${TYK_GW_LOGFORMAT:-json}
       TYK_GW_ACCESSLOGS_ENABLED: ${TYK_GW_ACCESSLOGS_ENABLED:-true}
       TYK_GW_ACCESSLOGS_TEMPLATE: ${TYK_GW_ACCESSLOGS_TEMPLATE:-method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr}
@@ -150,7 +150,7 @@ services:
       TYK_PMP_ANALYTICSSTORAGECONFIG_HOST: ${REDIS_HOST:-tyk-redis}
       TYK_PMP_ANALYTICSSTORAGECONFIG_PORT: ${REDIS_INTERNAL_PORT:-6379}
       TYK_PMP_PURGEDELAY: ${TYK_PUMP_PURGE_DELAY:-10}
-      TYK_LOGLEVEL: ${TYK_PUMP_LOG_LEVEL:-debug}
+      TYK_LOGLEVEL: ${TYK_PUMP_LOG_LEVEL:-info}
     depends_on:
       tyk-redis:
         condition: service_healthy

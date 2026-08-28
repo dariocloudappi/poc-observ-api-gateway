@@ -115,13 +115,19 @@ param serviceNamespace string = 'poc-observability'
 // tykOrgId si es parametro, mas abajo, porque lo necesita el sidecar que
 // mantiene las credenciales: Tyk indexa las claves de basic auth como
 // org_id + usuario.
-// Nivel de log de Tyk, gateway y pump. En debug para mostrar el detalle de
-// cada salto, incluido el middleware que rechaza una peticion.
-// Para reducir el volumen: variable de repositorio TYK_LOG_LEVEL a info.
-param tykLogLevel string = 'debug'
+// Nivel de log de Tyk, gateway y pump.
+//
+// En debug el gateway registra el detalle de cada salto, incluido el middleware
+// que rechaza una peticion, pero emite varias lineas por peticion y su ingesta
+// pasa a dominar la de la cuenta. En info quedan arranque, errores y los access
+// logs, que ya llevan metodo, ruta, estado, latencias y trace_id.
+//
+// Para diagnosticar un problema concreto, elevar temporalmente el nivel con la
+// variable de repositorio TYK_LOG_LEVEL.
+param tykLogLevel string = 'info'
 param tykEnableDetailedRecording string = 'false'
 param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr'
-// El colector se mantiene en info, a diferencia del resto de componentes.
+// El colector, en info por el mismo motivo que el gateway.
 //
 // Sus propios logs se ingieren mediante filelog y en debug generan del orden de
 // 3,6 registros por segundo de forma sostenida, unos 300.000 diarios, con lo

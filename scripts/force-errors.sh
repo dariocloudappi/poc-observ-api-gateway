@@ -194,7 +194,11 @@ if [ "${USERNAME_API_USERS:-}" = "${USERNAME_API_ORDERS:-}" ]; then
   echo "       dos APIs devolvera 401 sin que sea culpa de este script." >&2
 fi
 
-CURL_OPTS=(--silent --show-error --max-time "${CURL_MAX_TIME:-30}")
+# Un minuto de espera por peticion. Con menos, una respuesta lenta se corta
+# desde aqui: curl cierra la conexion, el resumen la anota como 000 y esa
+# peticion no llega a generar telemetria, de modo que el recuento que ve una
+# alerta queda por debajo del numero de peticiones lanzadas.
+CURL_OPTS=(--silent --show-error --max-time "${CURL_MAX_TIME:-60}")
 if [ "${GATEWAY_ALLOW_INSECURE_TLS:-false}" = "true" ]; then
   CURL_OPTS+=(--insecure)
 fi

@@ -122,11 +122,10 @@ for entry in "${APPS[@]}"; do
   # HUELLA de la credencial, para poder comparar lo que se ESCRIBE aqui con lo
   # que luego se ENVIA al verificar, sin revelar el valor.
   #
-  # Existe porque el sintoma era irreproducible por deduccion: la pipeline crea
-  # la clave y la comprueba con el MISMO secret, asi que deberia funcionar
-  # siempre. Cuando no funciona, significa que algo transforma el valor en uno
-  # de los dos caminos. Comparando longitud y hash se ve de inmediato si el
-  # valor escrito y el enviado son el mismo, y cuando dejan de serlo.
+  # La pipeline crea la clave y la comprueba con el mismo secreto, de modo que
+  # un fallo implica que algo transforma el valor en uno de los dos caminos.
+  # Comparar longitud y hash permite ver si el valor escrito y el enviado
+  # coinciden.
   fingerprint() {
     printf '%s' "$1" | sha256sum | cut -c1-12
   }
@@ -136,16 +135,15 @@ for entry in "${APPS[@]}"; do
 
   # El payload se construye con jq y NO interpolando en una plantilla.
   #
-  # MOTIVO, medido contra el gateway: al meter la contrasena directamente
-  # dentro de una cadena JSON, cualquier barra invertida que forme un escape
-  # JSON valido cambia el valor almacenado SIN dar error. Con una contrasena
-  # que contenga barra-n, barra-t o barra-slash, el aprovisionamiento
-  # respondia 200, la clave quedaba en Redis y el consumidor recibia 401 para
-  # siempre: Tyk habia guardado el escape ya decodificado, distinto de lo que
-  # envia el cliente. Con dos barras seguidas la peticion fallaba con 400.
+  # Al insertar la contrasena directamente en una cadena JSON, cualquier barra
+  # invertida que forme un escape JSON valido altera el valor almacenado sin
+  # producir error. Con secuencias como barra-n, barra-t o barra-slash el
+  # aprovisionamiento responde 200 y la clave queda en Redis, pero el consumidor
+  # obtiene 401 de forma permanente, porque Tyk guarda el escape ya
+  # decodificado. Con dos barras consecutivas la peticion responde 400.
   #
-  # jq escapa el valor segun JSON, asi que la contrasena llega intacta sea
-  # cual sea su contenido.
+  # jq escapa el valor conforme a JSON, de modo que la contrasena llega intacta
+  # cualquiera que sea su contenido.
   payload=$(jq -n \
     --arg org "$TYK_ORG_ID" \
     --arg api "$API_ID" \

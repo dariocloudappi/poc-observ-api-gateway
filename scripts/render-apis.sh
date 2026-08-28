@@ -4,16 +4,16 @@
 # -----------------------------------------------------------------------------
 # Renderiza las definiciones de API de Tyk desde tyk/apps/*.json.tpl.
 #
-# Por que existe y por que NO va dentro del contenedor: desde la v5.3, y de
-# forma completa desde la v5.5, las imagenes de Tyk Gateway son DISTROLESS. No
-# hay /bin/sh, ni sed, ni base64, ni chmod. Un entrypoint de shell dentro de la
-# imagen no puede arrancar. Asi que el renderizado ocurre FUERA:
+# El renderizado se realiza fuera del contenedor porque las imagenes de Tyk
+# Gateway son distroless desde la v5.3, y por completo desde la v5.5: no
+# incluyen /bin/sh, sed, base64 ni chmod, de modo que un entrypoint de shell
+# dentro de la imagen no puede ejecutarse.
 #
-#   - en CI: este script lo ejecuta el pipeline y el resultado viaja como
-#     secreto del Container App, montado como fichero en /opt/tyk-gateway/apps
-#   - en local: este script lo ejecutas tu y docker-compose monta el directorio
+#   - en CI: lo ejecuta la pipeline y el resultado viaja como secreto del
+#     Container App, montado como fichero en /opt/tyk-gateway/apps
+#   - en local: se ejecuta manualmente y docker-compose monta el directorio
 #
-# El mismo renderizador para los dos caminos, para que no divergan.
+# Un unico renderizador para ambos caminos, para evitar divergencias.
 #
 # Uso:
 #   ./scripts/render-apis.sh [directorio-de-salida]

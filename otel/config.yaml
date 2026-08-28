@@ -10,31 +10,19 @@
 #   TYK_PUMP_METRICS_ENDPOINT host:port of the Tyk Pump prometheus pump
 #   OTEL_TELEMETRY_LOG_LEVEL  collector self-telemetry log level
 #
-# Entrada de logs, dos receptores, los dos siempre escuchando:
-#   - fluentforward (24224): en local, alimentado por el driver de logging
+# Entrada de logs por dos receptores, ambos siempre activos:
+#   - fluentforward (24224): entorno local, mediante el driver de logging
 #     fluentd de docker compose.
-#   - udplog (5170): en Azure, alimentado por el transporte logstash de Tyk.
+#   - udplog (5170): Azure, mediante el transporte logstash de Tyk.
 #
-# POR QUE UDP Y NO TCP
-# --------------------
-# El hook de logstash de Tyk abre su conexion al inicializarse y NO reintenta
-# nunca. En Container Apps los contenedores de una replica arrancan en
-# paralelo sin garantia de orden, y el gateway suele ganar la carrera al
-# colector.
+# El transporte es UDP y no TCP. El hook de logstash de Tyk abre la conexion al
+# inicializarse y no reintenta. En Container Apps los contenedores de una
+# replica arrancan en paralelo sin garantia de orden, de modo que con TCP un
+# connection refused contra localhost:5170 deja el hook inservible durante toda
+# la vida del contenedor. Con UDP no hay conexion que rechazar: solo se pierden
+# los datagramas emitidos antes de que el colector escuche.
 #
-# Con TCP eso es fatal: connect contra localhost:5170 sin nadie escuchando da
-# connection refused, el hook muere y no se envia ni una linea durante toda la
-# vida del contenedor. Medido: 0 registros.
-#
-# Con UDP no: no hay conexion que rechazar y localhost siempre resuelve, asi
-# que el hook se inicializa bien, los primeros datagramas se pierden mientras
-# el colector arranca y a partir de ahi entran todos. Medido en un namespace
-# de red compartido, con el gateway arrancado 25 s antes que el colector: 22
-# registros recibidos y exportados a New Relic sin fallos.
-#
-# El precio es que UDP no garantiza entrega. Para una PoC de formacion es un
-# intercambio razonable: se pierden los primeros segundos de arranque a cambio
-# de que el canal no se pueda romper de forma permanente.
+# La contrapartida es que UDP no garantiza la entrega.
 # =============================================================================
 
 connectors:
@@ -48,16 +36,15 @@ connectors:
       - name: http.method
       - name: http.status_code
       - name: tyk.api.name
-      # Ruta agrupada, la construye transform/normalize_route. Sustituye a
-      # http.route, que estaba declarada aqui y NUNCA llegaba porque Tyk 5.12 no
-      # la produce: cualquier consulta con FACET http.route salia vacia.
+      # Ruta agrupada, generada por transform/normalize_route. Sustituye a
+      # http.route, que Tyk 5.12 no produce.
       - name: tyk.route
-    # Prefix of the generated metric names: tyk.gateway.calls and
-    # tyk.gateway.duration. Dots because that is the OTel convention for metric
-    # names, while the service.name of the gateway is tyk-gateway. Same words in
-    # both, so the metrics are findable from the name used in traces and logs.
+    # Prefijo de las metricas generadas: tyk.gateway.calls y
+    # tyk.gateway.duration. Con puntos, segun la convencion de OTel para nombres
+    # de metrica, frente al service.name del gateway, que es tyk-gateway.
     namespace: tyk.gateway
-    # Cardinality control matters more than resolution here.
+    # Intervalo amplio: aqui prima el control de cardinalidad sobre la
+    # resolucion temporal.
     metrics_flush_interval: 60s
     aggregation_temporality: "AGGREGATION_TEMPORALITY_DELTA"
 
@@ -166,8 +153,7 @@ processors:
       - key: cloud.provider
         value: azure
         action: insert
-      # Version de Tyk, para saber que gateway produjo la telemetria. Los dos
-      # microservicios ya reportan service.version y el gateway no lo hacia.
+      # Version de Tyk, para identificar el gateway que produjo la telemetria.
       - key: service.version
         value: "${env:SERVICE_VERSION}"
         action: upsert
@@ -182,31 +168,23 @@ processors:
         - 'attributes["http.target"] == "/hello"'
         - 'IsMatch(attributes["http.url"], ".*/health.*")'
 
-  # Ruta normalizada, para poder desglosar por recurso sin reventar la
-  # cardinalidad.
+  # Genera tyk.route, la ruta agrupada que permite desglosar por recurso con
+  # cardinalidad acotada. Ninguna dimension nativa de Tyk sirve para esto:
   #
-  # EL PROBLEMA: para agrupar por recurso hacen falta dos cosas a la vez, ruta
-  # identificable y cardinalidad acotada, y Tyk no ofrece ninguna dimension que
-  # tenga las dos:
+  #   http.route    no lo produce Tyk 5.12.
+  #   http.target   ruta cruda, /users/<uuid>/orders/<uuid>: una serie temporal
+  #                 por identificador.
+  #   span.name     igualmente cruda, y spanmetrics la anade siempre.
+  #   tyk.api.path  listen path, /api-users/v1: no distingue recursos.
   #
-  #   http.route    no existe. Tyk 5.12 no lo produce (medido).
-  #   http.target   existe, pero es la ruta CRUDA: /users/<uuid>/orders/<uuid>.
-  #                 Una serie temporal por identificador, cardinalidad infinita.
-  #   span.name     igual de crudo ("GET /users/<uuid>"), y spanmetrics lo anade
-  #                 siempre, no es configurable.
-  #   tyk.api.path  el listen path, /api-users/v1. Acotado, pero es la misma
-  #                 granularidad que tyk.api.name: no distingue recursos.
+  # Sustituye los identificadores por {id}, de modo que
+  # /users/3fa85f64-.../orders/7c9e6679-... queda como /users/{id}/orders/{id}.
   #
-  # LA SOLUCION: construir la ruta agrupada aqui, sustituyendo los
-  # identificadores por {id} antes de que spanmetrics genere las metricas.
-  # /users/3fa85f64-.../orders/7c9e6679-... pasa a /users/{id}/orders/{id}, que
-  # es UNA serie temporal por recurso real.
+  # Se declara en el pipeline de traces por delante de spanmetrics, dado que el
+  # conector es un exporter de ese pipeline y recibe los spans ya transformados.
   #
-  # Va en el pipeline de traces por delante de spanmetrics: el conector es un
-  # exporter de ese pipeline, asi que ve los spans ya transformados.
-  #
-  # Sin barras invertidas a proposito: OTTL las rechaza dentro de sus cadenas.
-  # De ahi [?] en vez de la version escapada.
+  # Los patrones no usan barras invertidas porque OTTL las rechaza dentro de sus
+  # cadenas: de ahi [?] en lugar de la forma escapada.
   transform/normalize_route:
     error_mode: ignore
     trace_statements:
@@ -215,19 +193,18 @@ processors:
           - set(attributes["tyk.route"], attributes["http.target"])
             where attributes["http.target"] != nil
 
-          # La query string fuera: ?page=2&size=10 tambien multiplica series.
+          # La query string tambien multiplica series: ?page=2&size=10.
           - replace_pattern(attributes["tyk.route"], "[?].*", "")
             where attributes["tyk.route"] != nil
 
-          # uuid, que es lo que usan los dos microservicios como id.
+          # uuid, el formato de identificador de los dos microservicios.
           - >-
             replace_pattern(attributes["tyk.route"],
             "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
             "{id}")
             where attributes["tyk.route"] != nil
 
-          # Ids numericos. El patron exige la barra delante justamente para no
-          # destrozar /v1, que tambien lleva un digito.
+          # Ids numericos. El patron exige la barra previa para no alterar /v1.
           - replace_pattern(attributes["tyk.route"], "/[0-9]+", "/{id}")
             where attributes["tyk.route"] != nil
 
@@ -238,14 +215,14 @@ processors:
         statements:
 
           # ------------------------------------------------------------
-          # Parse the JSON payload emitted by the gateway
+          # Parseo del JSON que emite el gateway
           # ------------------------------------------------------------
 
           - merge_maps(attributes, ParseJSON(body), "upsert")
             where body != nil and IsMatch(body, "^\\{")
 
           # ------------------------------------------------------------
-          # Rebuild a readable message for access log records
+          # Reconstruccion de un mensaje legible para los access logs
           # ------------------------------------------------------------
 
           - >-
@@ -258,7 +235,7 @@ processors:
             and attributes["status"] != nil
 
           # ------------------------------------------------------------
-          # Severity mapping
+          # Mapeo de severidad
           # ------------------------------------------------------------
 
           - set(severity_number, 5)
@@ -277,13 +254,13 @@ processors:
             where attributes["level"] != nil
 
           # ------------------------------------------------------------
-          # service.name, service.instance.id and trace correlation
-          # -----------------------------------------------------------
-          # The value MUST be the same one the gateway reports on its spans
-          # through TYK_GW_OPENTELEMETRY_RESOURCENAME, which is "tyk-gateway".
-          # With a different spelling New Relic resolves two separate entities,
-          # the "See logs" link of a span finds nothing, and any NRQL joining
-          # Span and Log by service.name silently returns empty.
+          # service.name, service.instance.id y correlacion de trazas
+          # ------------------------------------------------------------
+          # El valor debe coincidir con el que el gateway declara en sus spans
+          # mediante TYK_GW_OPENTELEMETRY_RESOURCENAME, es decir "tyk-gateway".
+          # Con otra escritura New Relic resuelve dos entidades distintas, el
+          # enlace "See logs" de un span no encuentra nada y cualquier NRQL que
+          # una Span y Log por service.name devuelve vacio.
           # ------------------------------------------------------------
 
           - set(attributes["service.name"], "tyk-gateway")
@@ -292,8 +269,9 @@ processors:
           - set(attributes["service.name"], "tyk-gateway")
             where attributes["service.name"] == nil
 
-          # service.instance.id is the semantic convention attribute. Named
-          # service.instance it is just a custom attribute nothing consumes.
+          # service.instance.id es el atributo de la convencion semantica. Con
+          # el nombre service.instance seria un atributo propio que nada
+          # consume.
           - set(attributes["service.instance.id"], attributes["container_name"])
             where attributes["container_name"] != nil
 
@@ -301,7 +279,7 @@ processors:
             where attributes["trace_id"] != nil
 
           # ------------------------------------------------------------
-          # Normalize HTTP attributes
+          # Normalizacion de atributos HTTP
           # ------------------------------------------------------------
 
           - set(attributes["http.method"], attributes["method"])
@@ -317,9 +295,9 @@ processors:
             where attributes["path"] != nil
 
           # ------------------------------------------------------------
-          # Audit trail: keep enough context to answer who, what and when
-          # without leaking the API key itself. Only the last 4 characters
-          # of the key identifier are kept.
+          # Trazabilidad de auditoria: se conserva el contexto suficiente para
+          # saber quien, que y cuando, sin exponer la clave de API. Solo se
+          # guardan los ultimos 4 caracteres del identificador.
           # ------------------------------------------------------------
 
           - >-
@@ -331,7 +309,7 @@ processors:
             where attributes["api_key"] != nil
 
           # ------------------------------------------------------------
-          # Cleanup
+          # Limpieza
           # ------------------------------------------------------------
 
           - delete_key(attributes, "msg")
@@ -340,9 +318,9 @@ processors:
           - delete_key(attributes, "trace_id")
             where attributes["trace_id"] != nil
 
-  # service.name segun el fichero del que viene el registro. Sin esto todos los
-  # logs de los sidecars caerian bajo tyk-gateway, que es el default que aplica
-  # transform/parse_tyk, y en New Relic serian indistinguibles.
+  # service.name segun el fichero de origen del registro. Sin esta asignacion
+  # todos los logs de los sidecars quedarian bajo tyk-gateway, el valor por
+  # defecto de transform/parse_tyk, y serian indistinguibles en New Relic.
   transform/name_sidecar_logs:
     error_mode: ignore
     log_statements:
@@ -361,15 +339,14 @@ processors:
           - set(attributes["log.source"], "sidecar-file")
             where attributes["log.file.name"] != nil
 
-          # Nivel de los logs de Redis. Su formato es texto plano, no JSON, asi
-          # que transform/parse_tyk no le aplica: el nivel va en un caracter
-          # tras la fecha, "*" informativo y "#" aviso o error.
+          # Nivel de los logs de Redis. Su formato es texto plano, no JSON, de
+          # modo que transform/parse_tyk no le aplica: el nivel es un caracter
+          # tras la fecha, "*" para informativo y "#" para aviso o error.
           #
-          # Los marcadores van como clase de caracteres, [*] y [#], y no
-          # escapados. Dos motivos: OTTL rechaza la barra invertida dentro de
-          # sus cadenas entrecomilladas, y un "#" precedido de espacio haria
-          # que YAML tomase el resto de la linea por un comentario. Dentro de
-          # los corchetes no pasa ninguna de las dos cosas.
+          # Los marcadores se expresan como clase de caracteres, [*] y [#], por
+          # dos motivos: OTTL rechaza la barra invertida dentro de sus cadenas
+          # entrecomilladas, y un "#" precedido de espacio haria que YAML tomase
+          # el resto de la linea por un comentario.
           - set(severity_number, 9)
             where attributes["log.file.name"] == "redis.log" and IsMatch(body, "[0-9]+:[A-Z] .* [*] ")
           - set(severity_number, 13)
@@ -379,15 +356,15 @@ processors:
           - set(severity_text, "warning")
             where attributes["log.file.name"] == "redis.log" and severity_number == 13
 
-  # ROMPE EL BUCLE DE REALIMENTACION. Sin esto el colector se autoalimenta:
-  # ingiere sus propios logs, cada exportacion de logs escribe una linea de
-  # debug en collector.log, filelog la lee, genera otro registro, que provoca
-  # otra exportacion, que escribe otra linea. Con OTEL_TELEMETRY_LOG_LEVEL en
-  # debug la amplificacion es inmediata y no converge.
+  # Rompe el bucle de realimentacion del colector. Sin este filtro el colector
+  # ingiere sus propios logs: cada exportacion escribe una linea de debug en
+  # collector.log, filelog la lee y genera otro registro, que provoca otra
+  # exportacion. Con OTEL_TELEMETRY_LOG_LEVEL en debug la amplificacion no
+  # converge.
   #
-  # Se descartan las lineas del propio colector que hablan de exportar o
-  # procesar telemetria, y se conserva lo que de verdad interesa vigilar:
-  # arranque, errores, memory_limiter y datos rechazados.
+  # Se descartan las lineas del colector referidas a exportar o procesar
+  # telemetria, y se conservan arranque, errores, memory_limiter y datos
+  # rechazados.
   filter/break_collector_loop:
     error_mode: ignore
     logs:
@@ -398,7 +375,7 @@ processors:
     error_mode: ignore
     logs:
       log_record:
-        # Health probe noise and gateway internal chatter.
+        # Ruido de las sondas de salud y trafico interno del gateway.
         - 'severity_number <= 5 and IsMatch(body, ".*health.*")'
         - 'severity_number <= 5 and IsMatch(body, ".*Primary instance.*")'
         - 'IsMatch(body, "tyk-analytics=")'
@@ -416,21 +393,22 @@ processors:
           - delete_key(attributes, "Authorization") where attributes["Authorization"] != nil
 
           # ------------------------------------------------------------
-          # El procesador "redaction" NO soporta logs en el colector
-          # v0.100.0: declararlo en el pipeline de logs aborta el arranque
-          # con "telemetry type is not supported". Sus blocked_values se
-          # replican aqui con OTTL, que si funciona sobre logs.
-          # Sin backreferencias ($1) a proposito: el colector expande "$"
-          # como variable de entorno.
+          # El procesador "redaction" no soporta logs en el colector v0.100.0:
+          # declararlo en el pipeline de logs aborta el arranque con
+          # "telemetry type is not supported". Sus blocked_values se replican
+          # aqui con OTTL, que si opera sobre logs.
+          #
+          # Los patrones no usan backreferencias porque el colector expande el
+          # simbolo de dolar como variable de entorno.
           # ------------------------------------------------------------
 
-          # El cuantificador {16,} NO es cosmetico. Con "+" a secas este patron
-          # matcheaba las PALABRAS "basic auth" del mensaje de error de Tyk
+          # El cuantificador {16,} restringe el patron a credenciales reales.
+          # Con "+" a secas tambien coincidiria con las palabras "basic auth"
+          # del mensaje de error de Tyk
           #   Base64 Decoding failed of basic auth data: illegal base64 data...
-          # y lo convertia en "... of REDACTED data: ...", destruyendo justo el
-          # diagnostico que hacia falta para entender un 400. Una credencial
-          # real en base64 pasa de 16 caracteres; palabras como "auth" o "data"
-          # no llegan, asi que sobreviven al redactado.
+          # que quedaria como "... of REDACTED data: ...", eliminando el
+          # diagnostico necesario para interpretar un 400. Una credencial en
+          # base64 supera los 16 caracteres; terminos como "auth" o "data" no.
           - replace_pattern(body, "(?i)(bearer|basic) +[A-Za-z0-9+/=._-]{16,}", "REDACTED")
             where IsString(body)
 
@@ -459,19 +437,19 @@ processors:
         action: insert
 
   # -------------------------------------------------------------------------
-  # One service.name per component of the container app
+  # Un service.name por componente del container app
   # -------------------------------------------------------------------------
-  # The metrics pipelines are split by source precisely so each one can be
-  # stamped here: a processor applies to everything that crosses its pipeline,
-  # so a single shared metrics pipeline cannot give different names to Redis,
-  # the pump and the collector.
+  # Los pipelines de metricas estan separados por origen para poder asignar el
+  # nombre aqui: un procesador se aplica a todo lo que atraviesa su pipeline, de
+  # modo que un pipeline compartido no puede dar nombres distintos a Redis, al
+  # pump y al colector.
   #
-  # Without these, Redis metrics arrive with NO service.name at all and land in
-  # New Relic as an unnamed entity, and the pump gets its name by accident from
-  # the Prometheus job_name instead of by decision.
+  # Sin estas asignaciones las metricas de Redis llegan sin service.name y
+  # aparecen en New Relic como entidad sin nombre, y el pump toma su nombre del
+  # job_name de Prometheus.
   #
-  # All of them keep the same service.namespace, so they stay grouped together
-  # as components of one gateway even though they are separate entities.
+  # Todos mantienen el mismo service.namespace, de forma que siguen agrupados
+  # como componentes de un mismo gateway aunque sean entidades separadas.
 
   resource/redis:
     attributes:
@@ -502,14 +480,14 @@ processors:
 
 exporters:
 
-  # Escribe en el stdout del colector un resumen por lote: cuantos spans,
-  # metricas o logs ha pasado por cada pipeline. Es la unica forma de
-  # distinguir "no entra nada al colector" de "entra pero no consigo
-  # exportarlo a New Relic", y sin eso el diagnostico es a ciegas.
+  # Escribe en el stdout del colector un resumen por lote con el numero de
+  # spans, metricas y logs que ha pasado por cada pipeline. Permite distinguir
+  # entre "no entra telemetria al colector" y "entra pero no se exporta a New
+  # Relic".
   #
-  # verbosity basic a proposito, NO detailed: imprime solo contadores. Con
-  # detailed volcaria el contenido de cada registro al log, lo que multiplica
-  # el volumen y ademas sacaria a stdout cabeceras y cuerpos.
+  # La verbosidad es basic, no detailed: imprime solo contadores. Con detailed
+  # se volcaria el contenido de cada registro, lo que multiplica el volumen y
+  # expone cabeceras y cuerpos en stdout.
   debug:
     verbosity: basic
 
@@ -542,20 +520,20 @@ service:
         - memory_limiter
         - filter/drop_health_traces
         - resource
-        # Por delante de spanmetrics a proposito, ver el comentario del
-        # procesador: si fuese despues, la metrica no tendria tyk.route.
+        # Debe preceder a spanmetrics: en otro orden la metrica no llevaria
+        # tyk.route.
         - transform/normalize_route
         - transform/remove_sensitive
         - redaction
         - batch/traces
       exporters: [otlphttp/newrelic, spanmetrics, debug]
 
-    # One pipeline per source, so each component can be named explicitly.
-    # Splitting is not cosmetic: a processor cannot distinguish which receiver
-    # a metric came from, so a shared pipeline can only apply one name.
+    # Un pipeline por origen, para poder nombrar cada componente. Un procesador
+    # no distingue de que receptor procede una metrica, de modo que un pipeline
+    # compartido solo podria aplicar un unico nombre.
 
-    # Derived from the gateway spans, so it already carries
-    # service.name = tyk-gateway from the traces resource.
+    # Derivadas de los spans del gateway, por lo que ya llevan
+    # service.name = tyk-gateway del resource del pipeline de traces.
     metrics/spanmetrics:
       receivers: [spanmetrics]
       processors:
@@ -595,8 +573,8 @@ service:
       receivers: [fluentforward, udplog/tyk, filelog/sidecars]
       processors:
         - memory_limiter
-        # El corta-bucles va PRIMERO: cuanto antes se descarte la
-        # realimentacion, menos trabajo inutil hace el resto del pipeline.
+        # El corta-bucles va primero: cuanto antes se descarte la
+        # realimentacion, menos trabajo realiza el resto del pipeline.
         - filter/break_collector_loop
         - transform/parse_tyk
         - transform/name_sidecar_logs
@@ -610,10 +588,9 @@ service:
   telemetry:
     logs:
       level: "${env:OTEL_TELEMETRY_LOG_LEVEL}"
-      # Duplica los logs del colector a un fichero del volumen compartido para
-      # que filelog/sidecars los recoja. stdout se mantiene: sin el, el log
-      # stream de Container Apps se queda vacio y se pierde la unica forma de
-      # depurar el colector cuando no consigue exportar.
+      # Duplica los logs del colector en un fichero del volumen compartido para
+      # que filelog/sidecars los recoja. Se mantiene stdout porque, sin el, el
+      # log stream de Container Apps queda vacio.
       output_paths:
         - stdout
         - /var/log/pod/collector.log

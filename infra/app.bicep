@@ -107,32 +107,29 @@ param environmentName string = 'poc'
 param serviceVersion string = 'unknown'
 param serviceNamespace string = 'poc-observability'
 
-// Los upstreams (url, usuario, contrasena) y tykDetailedTracing YA NO son
-// parametros de la plantilla: los consume scripts/render-apis.sh en el
-// pipeline, que produce las definiciones de API ya resueltas. La plantilla solo
-// recibe el resultado, como secreto.
+// Los upstreams (url, usuario, contrasena) y tykDetailedTracing no son
+// parametros de la plantilla: los consume scripts/render-apis.sh en la
+// pipeline, que produce las definiciones de API ya resueltas. La plantilla
+// recibe unicamente el resultado, como secreto.
 //
-// tykOrgId SI vuelve a ser parametro, mas abajo: lo necesita el sidecar que
-// mantiene las credenciales, porque Tyk indexa las claves de basic auth como
+// tykOrgId si es parametro, mas abajo, porque lo necesita el sidecar que
+// mantiene las credenciales: Tyk indexa las claves de basic auth como
 // org_id + usuario.
-// Nivel de log de Tyk, gateway y pump. En debug: es una PoC de formacion y lo
-// que se busca es ver el detalle de cada salto, incluido el middleware que
-// rechaza una peticion.
-// Para bajar el volumen: variable de repositorio TYK_LOG_LEVEL a info.
+// Nivel de log de Tyk, gateway y pump. En debug para mostrar el detalle de
+// cada salto, incluido el middleware que rechaza una peticion.
+// Para reducir el volumen: variable de repositorio TYK_LOG_LEVEL a info.
 param tykLogLevel string = 'debug'
 param tykEnableDetailedRecording string = 'false'
 param tykAccessLogsTemplate string = 'method,path,status,latency_total,latency_gateway,upstream_latency,trace_id,api_id,api_key,client_ip,user_agent,upstream_status,upstream_addr'
-// El colector va en INFO y no en debug, al contrario que el resto.
+// El colector se mantiene en info, a diferencia del resto de componentes.
 //
-// Motivo medido: sus propios logs se ingieren ahora por filelog, y en debug
-// generaba 3,6 registros por segundo de forma sostenida, unos 300.000 al dia.
-// Eso hacia que la telemetria del colector dominase la ingesta de la cuenta
-// sin aportar nada una vez confirmado que el envio funciona.
+// Sus propios logs se ingieren mediante filelog y en debug generan del orden de
+// 3,6 registros por segundo de forma sostenida, unos 300.000 diarios, con lo
+// que la telemetria del colector domina la ingesta de la cuenta.
 //
-// En info sigue registrando lo que importa vigilar: arranque, errores de
-// exportacion, memory_limiter y datos rechazados. Subelo a debug solo mientras
-// diagnostiques por que no llega algo, con la variable de repositorio
-// OTEL_TELEMETRY_LOG_LEVEL.
+// En info registra arranque, errores de exportacion, memory_limiter y datos
+// rechazados. Para diagnosticar una falta de datos, elevar temporalmente el
+// nivel con la variable de repositorio OTEL_TELEMETRY_LOG_LEVEL.
 param otelTelemetryLogLevel string = 'info'
 
 @description('Imagen del sidecar que mantiene las credenciales de consumidor en Redis')
@@ -391,24 +388,19 @@ var baseContainers = [
         name: 'TYK_GW_TRACK404LOGS'
         value: 'false'
       }
-      // Envio de logs del gateway al colector. El TRANSPORTE ES UDP, y esa
-      // eleccion no es cosmetica.
+      // Envio de logs del gateway al colector. El transporte es UDP.
       //
-      // El hook de logstash de Tyk abre su conexion al inicializarse y NO
-      // reintenta nunca. En Container Apps los contenedores de una replica
-      // arrancan en paralelo sin garantia de orden, y el gateway suele
-      // inicializar antes de que el colector escuche en :5170.
+      // El hook de logstash de Tyk abre la conexion al inicializarse y no
+      // reintenta. En Container Apps los contenedores de una replica arrancan
+      // en paralelo sin garantia de orden, y el gateway suele inicializar antes
+      // de que el colector escuche en :5170.
       //
-      // Con TCP eso era fatal: connect contra localhost:5170 sin nadie
-      // escuchando da connection refused, el hook muere y el contenedor no
-      // envia ni una linea mientras viva. Medido: 0 registros.
+      // Con TCP, un connection refused contra localhost:5170 deja el hook
+      // inservible y el contenedor no envia ninguna linea mientras viva. Con
+      // UDP no hay conexion que rechazar: solo se pierden los datagramas
+      // emitidos durante los primeros segundos.
       //
-      // Con UDP no hay conexion que rechazar y localhost siempre resuelve, asi
-      // que el hook se inicializa bien y solo se pierden los datagramas de los
-      // primeros segundos. Medido con el gateway arrancado 25 s antes que el
-      // colector: 22 registros recibidos y exportados a New Relic sin fallos.
-      //
-      // No cambiar a tcp sin volver a medirlo.
+      // Cambiar a tcp requiere validar de nuevo este comportamiento.
       {
         name: 'TYK_GW_USELOGSTASH'
         value: observabilityEnabled ? 'true' : 'false'
@@ -472,9 +464,9 @@ var baseContainers = [
       '--maxmemory-policy'
       'allkeys-lru'
       // Redis en debug, igual que el resto del stack. Con el nivel por defecto
-      // (notice) solo escribe arranque y guardados de RDB, asi que no se ve si
-      // el gateway y el pump estan leyendo y escribiendo de verdad.
-      // ATENCION: en debug Redis registra los comandos que recibe, y el gateway
+      // (notice) solo registra el arranque y los guardados de RDB, con lo que no
+      // se aprecia la actividad de lectura y escritura del gateway y del pump.
+      // En debug Redis registra los comandos que recibe, y el gateway
       // ejecuta varios por peticion. Es util para la formacion, pero es el
       // contenedor que mas volumen va a generar de los cuatro.
       '--loglevel'
@@ -497,23 +489,23 @@ var baseContainers = [
   // ---------------------------------------------------------------------------
   // Mantenedor de las credenciales de consumidor
   // ---------------------------------------------------------------------------
-  // Las credenciales de Basic Auth de Tyk viven SOLO en Redis, y Redis es un
-  // sidecar sin persistencia. Cada replica nueva arranca con Redis vacio y a
-  // partir de ese momento todo consumidor recibe:
+  // Las credenciales de Basic Auth de Tyk residen unicamente en Redis, que es
+  // un sidecar sin persistencia. Cada replica nueva arranca con Redis vacio y
+  // desde ese momento todo consumidor obtiene:
   //
   //   401 {"error": "User not authorised"}
   //
-  // El aprovisionamiento de la pipeline solo corre durante un despliegue, asi
-  // que no cubre los reinicios posteriores: un cambio de revision, un OOM o una
-  // reprogramacion de la plataforma dejaban el gateway rechazando a todo el
-  // mundo sin que nada lo detectase.
+  // El aprovisionamiento de la pipeline se ejecuta solo durante un despliegue y
+  // no cubre los reinicios posteriores: un cambio de revision, un OOM o una
+  // reprogramacion de la plataforma dejan el gateway rechazando todas las
+  // peticiones.
   //
   // Este contenedor arranca con la replica, espera a que el gateway responda en
-  // /hello y reescribe las credenciales. Verificado en local destruyendo Tyk y
-  // Redis a la vez: la autenticacion se recupera sola en un ciclo.
+  // /hello y reescribe las credenciales, con lo que la autenticacion se
+  // restablece en un ciclo.
   //
-  // Va en baseContainers y no en observabilityContainers a proposito: sin
-  // credenciales el gateway no sirve, asi que no debe depender de que la
+  // Se declara en baseContainers y no en observabilityContainers porque sin
+  // credenciales el gateway no presta servicio: no debe depender de que la
   // observabilidad este activada.
   {
     name: 'key-provisioner'

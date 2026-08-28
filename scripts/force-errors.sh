@@ -3,36 +3,33 @@
 # force-errors.sh
 # -----------------------------------------------------------------------------
 # Provoca errores a demanda contra el endpoint /force-errors de los dos
-# microservicios, ATRAVESANDO EL GATEWAY, para tener material real con el que
-# probar alertas y paneles en New Relic.
+# microservicios, a traves del gateway, para generar material con el que
+# validar alertas y paneles en New Relic.
 #
-# Por cada API y por cada codigo de la lista lanza N peticiones EN PARALELO y
-# comprueba que la respuesta es la que se pidio.
+# Por cada API y por cada codigo de la lista lanza N peticiones en paralelo y
+# verifica que la respuesta obtenida es la solicitada.
 #
 #   2 APIs x 9 codigos x 20 peticiones = 360 peticiones
 #
-# POR QUE NO BASTA CON MIRAR EL CODIGO DE RESPUESTA
-# -------------------------------------------------
-# Si pides un 401 y recibes un 401, no sabes si lo genero el microservicio o si
-# Tyk te rechazo por credenciales malas: los dos son 401. Lo mismo con el 403,
-# que es lo que devuelve Tyk cuando la clave no tiene acceso a la API, y con el
-# 504, que tambien es lo que devuelve Tyk cuando el upstream no contesta.
+# VALIDACION DE LA RESPUESTA
+# --------------------------
+# El codigo de estado no basta para saber si el error lo genero el
+# microservicio. Tyk devuelve 401 con credenciales invalidas, 403 cuando la
+# clave no tiene acceso a la API y 504 cuando el upstream no responde, de modo
+# que esos tres codigos son ambiguos.
 #
-# Un script que solo comparase el codigo daria POR BUENO justo el caso en el que
-# la peticion nunca llego al microservicio. Por eso cada respuesta se clasifica
-# ademas por el cuerpo: el error provocado lleva la marca "forced"
-# (FORCED_ERROR en users, "Forced Error" en orders) y el rechazo del gateway no.
+# Cada respuesta se clasifica tambien por el cuerpo: el error provocado incluye
+# la marca "forced" (FORCED_ERROR en users, "Forced Error" en orders) y el
+# rechazo del gateway no.
 #
 # CREDENCIALES
 # ------------
-# Nunca van en este fichero. Se leen del entorno o de un .env, con los mismos
-# nombres que usa la pipeline:
+# No se incluyen en este fichero. Se leen del entorno o de un .env, con los
+# mismos nombres que emplea la pipeline:
 #
 #   GATEWAY_BASE_URL
 #   USERNAME_API_USERS  / PASSWORD_API_USERS
 #   USERNAME_API_ORDERS / PASSWORD_API_ORDERS
-#
-# Con --from-azure se sacan de los secretos del container app.
 #
 # USO
 #   ./scripts/force-errors.sh                    las dos APIs, los 9 codigos
@@ -41,7 +38,6 @@
 #   ./scripts/force-errors.sh --status 500,503   varios
 #   ./scripts/force-errors.sh --requests 50      otra cantidad en paralelo
 #   ./scripts/force-errors.sh --method GET       atajo por query param
-#   ./scripts/force-errors.sh --from-azure       credenciales del container app
 #   ./scripts/force-errors.sh --yes              sin confirmacion, para CI
 #
 # Sale con 0 si todas las respuestas fueron las pedidas, con 1 si alguna no.
@@ -52,19 +48,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# .env, primero el del repo y luego el de scripts/, para no obligar a moverlo.
+# Carga del .env, primero el del repositorio y luego el de scripts/.
 #
-# NO se hace con "set -a; . .env", que es lo habitual, porque eso hace que el
-# fichero GANE a lo que pases por linea de comandos:
+# No se emplea "set -a; . .env" porque con esa forma el fichero prevalece sobre
+# las variables indicadas en la linea de comandos, de modo que
 #
 #   GATEWAY_BASE_URL=https://otro ./scripts/force-errors.sh
 #
-# se iria silenciosamente al gateway del .env. Aqui el .env solo rellena lo que
-# NO viene ya del entorno, que es el orden que espera cualquiera.
+# se dirigiria al gateway declarado en el .env. Aqui el .env solo completa las
+# variables que no vienen ya del entorno.
 load_env_file() {
   local file="$1" line key val
-  # La comilla simple en una variable, porque escribirla dentro de un patron de
-  # case es una fuente inagotable de erratas.
+  # La comilla simple se guarda en una variable: dentro de un patron de case
+  # resulta ambigua.
   local sq="'"
   [ -f "$file" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -96,19 +92,18 @@ load_env_file "$SCRIPT_DIR/.env"
 # Valores por defecto
 # -----------------------------------------------------------------------------
 
-# Ascendente, y los 5xx al final a proposito: si algo va mal se ve con los 4xx,
-# que son inofensivos, antes de empezar a generar errores de servidor.
+# Orden ascendente, con los 5xx al final: un fallo de configuracion se detecta
+# con los 4xx, inocuos, antes de generar errores de servidor.
 DEFAULT_STATUSES="400,401,403,405,409,415,500,503,504"
 
 REQUESTS="${REQUESTS:-20}"
 METHOD="${METHOD:-POST}"
 APIS="users orders"
 STATUSES="$DEFAULT_STATUSES"
-FROM_AZURE=false
 ASSUME_YES=false
 
 usage() {
-  sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
+  sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,\} \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -117,7 +112,6 @@ while [ $# -gt 0 ]; do
     --status)     STATUSES="$2"; shift 2 ;;
     --requests)   REQUESTS="$2"; shift 2 ;;
     --method)     METHOD="$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')"; shift 2 ;;
-    --from-azure) FROM_AZURE=true; shift ;;
     --yes|-y)     ASSUME_YES=true; shift ;;
     -h|--help)    usage; exit 0 ;;
     *) echo "ERROR: opcion desconocida '$1'. Usa --help." >&2; exit 2 ;;
@@ -157,33 +151,6 @@ if [ -z "$GATEWAY_BASE_URL" ]; then
 fi
 GATEWAY_BASE_URL="${GATEWAY_BASE_URL%/}"
 
-# -----------------------------------------------------------------------------
-# Credenciales
-# -----------------------------------------------------------------------------
-
-if [ "$FROM_AZURE" = true ]; then
-  : "${AZ_RESOURCE_GROUP:?falta AZ_RESOURCE_GROUP para --from-azure}"
-  : "${AZ_CONTAINERAPP:?falta AZ_CONTAINERAPP para --from-azure}"
-  command -v az >/dev/null 2>&1 || {
-    echo "ERROR: --from-azure necesita la CLI de az en el PATH" >&2
-    exit 2
-  }
-
-  az_secret() {
-    az containerapp secret show \
-      --resource-group "$AZ_RESOURCE_GROUP" \
-      --name "$AZ_CONTAINERAPP" \
-      --secret-name "$1" \
-      --query value -o tsv 2>/dev/null || true
-  }
-
-  echo "Leyendo credenciales de los secretos de $AZ_CONTAINERAPP..."
-  USERNAME_API_USERS="$(az_secret consumer-user-api-users)"
-  PASSWORD_API_USERS="$(az_secret consumer-password-api-users)"
-  USERNAME_API_ORDERS="$(az_secret consumer-user-api-orders)"
-  PASSWORD_API_ORDERS="$(az_secret consumer-password-api-orders)"
-fi
-
 # Huella, para poder comparar credenciales sin escribirlas en ningun log.
 fingerprint() {
   local v="$1"
@@ -213,14 +180,14 @@ for api in $APIS; do
     UP="$(printf '%s' "$api" | tr '[:lower:]' '[:upper:]')"
     echo "ERROR: faltan las credenciales de api-$api." >&2
     echo "       Define USERNAME_API_$UP y PASSWORD_API_$UP," >&2
-    echo "       o usa --from-azure con AZ_RESOURCE_GROUP y AZ_CONTAINERAPP." >&2
+    echo "       en el entorno o en el .env del repositorio." >&2
     exit 2
   fi
 done
 
-# El mismo usuario en las dos APIs fue la causa del 401 que nos costo horas: Tyk
-# indexa las claves por org_id + username, asi que la segunda sobrescribe a la
-# primera y una de las dos APIs deja de autenticar.
+# Tyk indexa las claves por org_id + username. Con el mismo usuario en las dos
+# APIs la segunda clave sobrescribe la primera y una de las dos deja de
+# autenticar.
 if [ "${USERNAME_API_USERS:-}" = "${USERNAME_API_ORDERS:-}" ]; then
   echo "AVISO: las dos APIs usan el MISMO username. Tyk indexa las claves por" >&2
   echo "       org_id + username, asi que una sobrescribe a la otra y una de las" >&2
@@ -293,9 +260,9 @@ trap cleanup EXIT INT TERM
 # -----------------------------------------------------------------------------
 # Una peticion
 # -----------------------------------------------------------------------------
-# Escribe una linea "codigo|segundos|forced|rc" en un fichero. NUNCA falla: si
-# curl se cae, un set -e tumbaria el script entero desde un subshell en segundo
-# plano y perderiamos el resto de la tanda.
+# Escribe una linea "codigo|segundos|forced|rc" en un fichero. No propaga
+# errores: con set -e activo, un fallo de curl en un subshell en segundo plano
+# abortaria el script y se perderia el resto de la tanda.
 do_request() {
   local api="$1" status="$2" idx="$3" user="$4" pass="$5"
   local url="${GATEWAY_BASE_URL}/api-${api}/v1/force-errors"
@@ -318,7 +285,8 @@ do_request() {
   fi
 
   if [ "$rc" -ne 0 ]; then
-    # 000 = no hubo respuesta. rc 28 es timeout, rc 7 conexion rechazada.
+    # 000 indica ausencia de respuesta. rc 28 es timeout; rc 7, conexion
+    # rechazada.
     echo "000|0|no|$rc" > "$out"
     return 0
   fi
@@ -338,9 +306,8 @@ do_request() {
 # -----------------------------------------------------------------------------
 # Comprobacion previa
 # -----------------------------------------------------------------------------
-# Un 400 provocado, que es inofensivo, antes de lanzar cientos de peticiones. Si
-# las credenciales estan mal o el endpoint no esta desplegado, se sabe aqui y no
-# despues de haber generado 360 errores inutiles.
+# Lanza un 400 provocado, inocuo, antes de generar la carga completa. Detecta
+# aqui credenciales invalidas o un endpoint no desplegado.
 preflight() {
   local api="$1" user pass code forced
   user="$(user_for "$api")"
@@ -409,7 +376,7 @@ for api in $APIS; do
     for i in $(seq 1 "$REQUESTS"); do
       do_request "$api" "$status" "$i" "$USER_A" "$PASS_A" &
     done
-    # Tanda a tanda a proposito: 20 en paralelo por codigo, no 360 de golpe.
+    # Por tandas: 20 peticiones en paralelo por codigo, no las 360 a la vez.
     wait
     ok=$(cat "$TMP"/res."$api"."$status".[0-9]* 2>/dev/null \
       | awk -F'|' -v s="$status" '$1==s && $3=="yes"' | wc -l | tr -d ' ')

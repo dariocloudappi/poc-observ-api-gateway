@@ -5,34 +5,34 @@
 # Mantiene vivas las credenciales de consumidor del gateway. Corre como
 # contenedor sidecar dentro de la misma replica que Tyk.
 #
-# POR QUE EXISTE
-# --------------
-# Las credenciales de Basic Auth de Tyk viven SOLO en Redis, y aqui Redis es un
-# sidecar sin persistencia. Cada replica nueva, cada cambio de revision y cada
-# reprogramacion de la plataforma arranca con un Redis vacio, y a partir de ese
-# momento todo consumidor recibe:
+# FUNCION
+# -------
+# Las credenciales de Basic Auth de Tyk residen unicamente en Redis, que aqui es
+# un sidecar sin persistencia. Cada replica nueva, cada cambio de revision y
+# cada reprogramacion de la plataforma parte de un Redis vacio, tras lo cual
+# todo consumidor obtiene:
 #
 #   401 {"error": "User not authorised"}
 #
-# Reproducido en local: con un Redis recien creado las unicas claves que quedan
-# son las internas de Tyk (tyk-liveness-probe, host-checker, version-check) y
-# ninguna de usuario.
+# En un Redis recien creado solo permanecen las claves internas de Tyk
+# (tyk-liveness-probe, host-checker, version-check).
 #
-# El aprovisionamiento de la pipeline solo corre durante un despliegue, asi que
-# no cubre los reinicios posteriores. Este bucle si: arranca con la replica,
-# espera a que el gateway responda y reescribe las credenciales.
+# El aprovisionamiento de la pipeline se ejecuta solo durante un despliegue y no
+# cubre los reinicios posteriores. Este bucle arranca con la replica, espera a
+# que el gateway responda y reescribe las credenciales.
 #
-# POR QUE UPSERT INCONDICIONAL Y NO "comprobar y crear si falta"
-# --------------------------------------------------------------
-# Porque comprobar no es fiable. Medido en local: despues de un FLUSHALL de
-# Redis, Tyk seguia autenticando y su API de administracion seguia devolviendo
-# la clave, porque mantiene la sesion en una cache en memoria. Un
-# check-then-create se habria creido que todo estaba bien mientras Redis estaba
-# vacio, y al reciclarse la cache habria empezado el 401.
+# ESCRITURA INCONDICIONAL
+# -----------------------
+# Se reescribe siempre en lugar de comprobar y crear si falta, porque la
+# comprobacion no es concluyente: tras un FLUSHALL de Redis, Tyk sigue
+# autenticando y su API de administracion sigue devolviendo la clave, dado que
+# conserva la sesion en una cache en memoria. Una comprobacion previa daria por
+# valido un estado en el que Redis esta vacio, y el 401 apareceria al reciclarse
+# la cache.
 #
-# Un POST a /tyk/keys/{nombre} es un upsert, asi que reescribir siempre es
+# Un POST a /tyk/keys/{nombre} es un upsert, de modo que reescribir es
 # idempotente y no depende de ninguna cache. El coste es una escritura por
-# ciclo, irrelevante a este intervalo.
+# ciclo.
 #
 # Variables:
 #   TYK_SECRET                   secreto de la API de administracion (obligatorio)
@@ -73,19 +73,18 @@ wait_for_gateway() {
   return 1
 }
 
-# Escapa un valor para poder meterlo dentro de una cadena JSON.
+# Escapa un valor para insertarlo en una cadena JSON.
 #
-# MOTIVO, medido contra el gateway: interpolar la contrasena directamente en la
-# plantilla JSON corrompe en silencio cualquier valor que lleve barra
-# invertida. Con una contrasena que contenga barra-n, barra-t o barra-slash el
-# POST respondia 200, la clave quedaba en Redis y el consumidor recibia 401
-# para siempre, porque Tyk almacenaba el escape ya decodificado y eso no
-# coincide con lo que envia el cliente. Con dos barras seguidas el POST fallaba
-# con 400.
+# Interpolar la contrasena directamente en la plantilla JSON corrompe cualquier
+# valor que contenga barra invertida: con secuencias como barra-n, barra-t o
+# barra-slash el POST responde 200 y la clave queda en Redis, pero el consumidor
+# obtiene 401 de forma permanente, porque Tyk almacena el escape ya
+# decodificado y deja de coincidir con lo que envia el cliente. Con dos barras
+# consecutivas el POST responde 400.
 #
-# Aqui no se puede usar jq: la imagen de curl no lo trae. Se escapa con sed y
-# el ORDEN IMPORTA: primero las barras invertidas, porque si se hiciera al
-# reves se volverian a escapar las que introduce el segundo patron.
+# La imagen de curl no incluye jq, de modo que el escapado se hace con sed. El
+# orden es relevante: primero las barras invertidas, ya que en orden inverso se
+# volverian a escapar las que introduce el segundo patron.
 # Detecta espacio en blanco al principio o al final de un valor.
 #
 # MOTIVO, reproducido contra el gateway: un salto de linea o un espacio final
@@ -120,10 +119,9 @@ upsert_key() {
 
   pass_json=$(json_escape "$pass")
 
-  # access_rights se indexa por api_id, asi que este valor DEBE coincidir con el
-  # api_id de la definicion de API. Si no coincide, Tyk autentica al usuario
-  # pero responde "Access to this API has been disallowed" con un 403, que es
-  # un sintoma distinto del 401.
+  # access_rights se indexa por api_id, por lo que este valor debe coincidir con
+  # el api_id de la definicion de API. Si no coincide, Tyk autentica al usuario
+  # pero responde 403 con "Access to this API has been disallowed".
   payload=$(cat <<JSON
 {
   "allowance": 1000,
@@ -192,16 +190,14 @@ process_api() {
     return 0
   fi
 
-  # Los dos puntos son IMPOSIBLES en Basic Auth, y hay que detectarlo aqui
-  # porque el sintoma es enganoso: la clave se crea sin error y el consumidor
-  # recibe un 400, no un 401.
+  # Basic Auth no admite dos puntos en las credenciales. Se comprueba aqui
+  # porque la clave se crea sin error y el consumidor recibe un 400, no un 401:
   #
-  # Medido contra el gateway: con dos puntos en la contrasena Tyk registra
   #   "Attempted access with malformed header, values not in basic auth format."
-  # y responde 400. El motivo es la propia especificacion: la cabecera lleva
-  # base64(usuario:contrasena) y se parte por el PRIMER dos puntos, asi que un
-  # dos puntos en el usuario es irrepresentable y Tyk exige exactamente dos
-  # partes, lo que descarta tenerlo tambien en la contrasena.
+  #
+  # La cabecera transporta base64(usuario:contrasena) y se divide por el primer
+  # dos puntos, de modo que un dos puntos en el usuario es irrepresentable. Tyk
+  # exige exactamente dos partes, lo que descarta tenerlo en la contrasena.
   case "$user" in
     *:*)
       log "ERROR ${api_id} el USUARIO contiene ':' y Basic Auth no lo admite. Cambia el secret."

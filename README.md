@@ -323,7 +323,7 @@ Copia `.env.example` a `.env` y sustituye todos los `CHANGE_ME`. **`.env` está 
 Se inyectan en las definiciones de API en el arranque del contenedor. **Nunca tocan un
 fichero versionado.**
 
-> **Ojo con dónde se crean.** Las dos `*_TARGET_URL` son **variables** y las cuatro
+> **Ubicación de cada valor.** Las dos `*_TARGET_URL` son **variables** y las cuatro
 > `*_BASIC_*` son **secrets**. El workflow lee las primeras con `vars.*` y las segundas con
 > `secrets.*`, así que una url creada en la pestaña *Secrets* se ve **vacía** desde `vars.*` y el
 > pipeline falla con *"repository variables ... must be set"* sin más explicación. Son urls, no
@@ -1068,7 +1068,7 @@ Analytics, lo que permite saltar de un sistema a otro sin integración adicional
 
 ### Borrado desde la CLI, la única vía
 
-Ojo al orden: el Diagnostic Setting de la suscripción vive **fuera** del resource group y
+Importa el orden: el Diagnostic Setting de la suscripción vive **fuera** del resource group y
 sobreviviría a su borrado, así que se elimina primero.
 
 ```bash

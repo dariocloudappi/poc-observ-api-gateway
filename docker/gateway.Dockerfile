@@ -24,8 +24,8 @@ ARG TYK_VERSION=v5.12.0
 
 FROM docker.tyk.io/tyk-gateway/tyk-gateway:${TYK_VERSION}
 
-# Configuracion base. Los secretos van vacios a proposito: se inyectan en
-# ejecucion con los overrides nativos TYK_GW_*.
+# Configuracion base. Los secretos se dejan vacios y se inyectan en ejecucion
+# mediante los overrides nativos TYK_GW_*.
 COPY tyk/tyk.conf /opt/tyk-gateway/tyk.conf
 
 COPY tyk/policies/ /opt/tyk-gateway/policies/

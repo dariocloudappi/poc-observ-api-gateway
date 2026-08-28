@@ -138,9 +138,9 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   properties: {
     // Sin observabilidad no se guarda nada. Con ella, todo sale por Azure
     // Monitor y el destino se decide en el diagnostic setting, no aqui.
-    // Efecto secundario deseado: se elimina el listKeys() del workspace, que
-    // devolvia un secreto nuevo en cada compilacion y ensuciaba el diff del
-    // despliegue sin que nada hubiese cambiado de verdad.
+    // Como efecto adicional se elimina el listKeys() del workspace, que
+    // devolvia un secreto nuevo en cada compilacion e introducia diferencias en
+    // el diff del despliegue sin que hubiese ningun cambio real.
     appLogsConfiguration: enableLogAnalytics ? {
       destination: 'azure-monitor'
     } : {

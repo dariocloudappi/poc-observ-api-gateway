@@ -122,9 +122,9 @@ jobs:
 
       - name: Validate non secret configuration
         run: |
-          # Ojo: estas dos se leen con vars.*, no con secrets.*, asi que tienen
-          # que estar en la pestana Variables. Creadas como secret, vars.* las ve
-          # vacias y este paso fallaba sin explicar por que.
+          # Estas dos se leen con vars.*, no con secrets.*, de modo que deben
+          # estar en la pestana Variables. Creadas como secret, vars.* las
+          # recibe vacias y el paso falla sin indicar el motivo.
           #
           # Ya no es obligatorio rellenarlas: si estan vacias, el paso
           # "Resolve the upstream urls" las descubre por etiqueta.
@@ -281,11 +281,11 @@ jobs:
           TYK_ORG_ID: ${{ vars.TYK_ORG_ID || 'poc-organization' }}
         run: |
           set -euo pipefail
-          # Se invoca con bash a proposito, no como ./script: asi no depende del
-          # bit de ejecucion. En Windows core.filemode suele estar en false, el
-          # chmod local no se registra en git y el runner recibe el fichero sin
-          # permisos (exit 126, Permission denied). El modo 100755 esta ademas
-          # registrado en el indice, pero esto lo hace inmune de todas formas.
+          # Se invoca con bash y no como ./script para no depender del bit de
+          # ejecucion. En Windows core.filemode suele estar en false, el chmod
+          # local no se registra en git y el runner recibe el fichero sin
+          # permisos (exit 126, Permission denied). El modo 100755 consta en el
+          # indice, pero esta forma es independiente de ello.
           bash scripts/render-apis.sh tyk/apps-rendered
 
           # base64 en una sola linea, para pasarlo por variable de entorno.
@@ -457,8 +457,8 @@ jobs:
             exit 1
           fi
 
-          # Un solo par configurado es valido, pero conviene avisar: la otra API
-          # quedara inaccesible y el sintoma sera un 401 dificil de atribuir.
+          # Un solo par configurado es valido, pero se advierte: la otra API
+          # quedara inaccesible y devolvera un 401 de origen poco evidente.
           for pair in "USERNAME_API_USERS:api-users" "USERNAME_API_ORDERS:api-orders"; do
             var="${pair%%:*}"
             api="${pair##*:}"
@@ -472,10 +472,10 @@ jobs:
           ./provision_key.sh
 
       # ---------------------------------------------------------------------
-      # Stage 6: la credencial funciona de verdad
+      # Stage 6: verificacion de la credencial contra el gateway
       # ---------------------------------------------------------------------
-      # Sin este paso el fallo era SILENCIOSO. El despliegue salia verde y el
-      # consumidor recibia 401 {"error": "User not authorised"}, que Tyk emite
+      # Sin este paso el fallo es silencioso: el despliegue termina en verde y
+      # el consumidor recibe 401 {"error": "User not authorised"}, que Tyk emite
       # tanto si el usuario no existe en Redis como si la contrasena no
       # coincide. Nada en la pipeline lo detectaba.
       #
@@ -520,7 +520,7 @@ jobs:
             ok_code=$(curl --silent --output /dev/null --write-out '%{http_code}'               --max-time 30 --user "${user}:${pass}" "${URL}${path}")
 
             if [ "$ok_code" = "403" ]; then
-              # 403 y 401 son problemas DISTINTOS, medido contra el gateway:
+              # 403 y 401 corresponden a problemas distintos:
               #   403 -> la clave existe y autentica, pero su access_rights
               #          apunta a un api_id que no coincide con el de la
               #          definicion de API cargada
@@ -533,15 +533,15 @@ jobs:
             elif [ "$ok_code" = "401" ]; then
               echo "  ${label}: FALLO -> ${path} devolvio 401 con la credencial correcta"
 
-              # De donde viene el 401? Tyk y el upstream devuelven los dos un
-              # 401 y se distinguen por el CUERPO, medido contra el gateway:
+              # Origen del 401. Tyk y el upstream devuelven ambos un 401 y se
+              # distinguen por el cuerpo de la respuesta:
               #
               #   Tyk       -> {"error": "User not authorised"}
               #   upstream  -> lo que devuelva el micro, sin esa firma
               #
-              # Distinguirlo es clave: el primero se arregla con los secrets
-              # USERNAME_API_* / PASSWORD_API_*, y el segundo con los
-              # UPSTREAM_*_BASIC_*, que son credenciales DISTINTAS. Tyk
+              # La distincion determina donde corregirlo: el primero con los
+              # secrets USERNAME_API_* / PASSWORD_API_*, y el segundo con los
+              # UPSTREAM_*_BASIC_*, que son credenciales distintas. Tyk
               # sustituye la cabecera Authorization del consumidor por la del
               # upstream antes de reenviar, asi que un 401 del micro no tiene
               # nada que ver con la credencial que uso el cliente.
